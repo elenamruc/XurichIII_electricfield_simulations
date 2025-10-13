@@ -7,9 +7,9 @@
 # and provides helper functions to read data and process the
 # electric field in cylindrical coordinates (r, z, Er, Ez).
 #
-# The goal is to evaluate the uniformity of the electric field
-# in the LXe region at low fields and to determine the optimal
-# electrode voltage configuration.
+# The main goal is to evaluate the field uniformity in the LXe region
+# and to determine the optimal electrode voltage configuration
+# by combining unit-field bases through superposition
 # =====================================================
 
 import numpy as np
@@ -20,36 +20,44 @@ from matplotlib.colors import LogNorm
 from scipy.optimize import minimize
 
 
-# ============== CONFIGURATION ==============
+# ============================================================
+# 1. CONFIGURATION
+# ============================================================
 
-# Paths to input CSV files
-PATH_BASIS     = "/Volumes/NUEVO VOL/superposition_3D_27mm_27mm.csv"   # unit field maps (1 V applied)
-PATH_EXAMPLES  = "example_3D_4000.csv"    # optional direct case for validation
-DO_VALIDATION  = True                    # whether to compare with PATH_EXAMPLES
+# Directory containing precomputed 1-V basis field files (HDF5 or CSV format)
+BASIS_DIR = "./basis_fields/"
+PATH_BASIS     = "/Volumes/NO NAME/superposition_3D_27mm_27mm.csv" 
 
-# --- Detector geometry (meters) ---
-D_CG           = 30.8e-3                  # cathode↔gate distance (m) for analytical seed
-d_cathode      = -0.0289/2 - 0.002       # cathode z-position (m)
-d_gate         = +0.0289/2                # gate z-position (m)
-d_anode        = +0.0289/2 + 0.0041       # anode z-position (m)
+# Directory for saving output plots
+output_path = "./plots/" 
+  
+# Optional validation case (for comparison with a direct COMSOL field)
+PATH_EXAMPLES  = "example_3D_4000.csv"
+DO_VALIDATION  = False                      # Set True only to compare with PATH_EXAMPLES (validation mode)
+
+# --- Detector geometry (all distances in meters) ---
+D_CG           = 30.8e-3                   # cathode-gate distance (m) for analytical seed
+d_cathode      = -0.0289/2 - 0.002         # cathode z-position (m)
+d_gate         = +0.0289/2                 # gate z-position (m)
+d_anode        = +0.0289/2 + 0.0041        # anode z-position (m)
 
 # --- ROI definitions (meters) ---
-R_DET_M        = (31.0/2.0) * 1e-3
-#ROI_R          = (0, (31.0/2.0) * 1e-3)
+R_DET_M        = (31.0/2.0) * 1e-3         # Radial detector extent
+#ROI_R          = (0, (31.0/2.0) * 1e-3)   # Radial range of interest for analysis
 ROI_R          = (0, 10.0 * 1e-3)
-MARGIN_Z       = 2e-3                     # 2 mm margin from electrodes
+MARGIN_Z       = 2e-3                      # Safety margin to avoid boundary artifacts near electrodes
 
-# LXe region (from cathode to gate)
+# LXe region: between cathode and gate
 ROI_LXe        = (ROI_R[0], ROI_R[1], d_cathode + MARGIN_Z, d_gate - MARGIN_Z)
 
-# GXe region (from gate to anode)
+# GXe region: between gate and anode (used for extraction-field study)
 ROI_GXe        = (ROI_R[0], ROI_R[1], d_gate + MARGIN_Z, d_anode - 5e-4)
 
-# --- ROIs para penalizar fugas y hotspot (en metros) ---
-# Banda inmediatamente por debajo del cátodo (captura hotspot y campo reverso con PMT inferior)
+# --- ROIs used for penalty terms in optimization ---
+# Below-cathode band (captures field reversal and PMT hotspot region)
 ROI_BELOW_CATH = (ROI_R[0], ROI_R[1], d_cathode - 6e-3, d_cathode - 1e-3)
 
-# Banda en el tope del LXe, justo bajo el gate (captura la "fuga" desde la región de extracción)
+# Near-gate band (captures field leakage from extraction region)
 ROI_TOP_LXE    = (ROI_R[0], ROI_R[1], d_gate - 1.0e-3,  d_gate - 3.0e-4)
 
 
@@ -58,11 +66,11 @@ EXTRACTION = 4000.0                       # Gate–Anode potential difference (V
 PMT_TOP_V  = -1000.0
 PMT_BOT_V  = -1000.0
 
-# --- HV limits ---
+# --- HV limits (for optimization constraints) ---
 ANODE_MAX = +5000.0                       # maximum anode voltage (V)
 GATE_MAX_BY_ANODE = ANODE_MAX - EXTRACTION
 
-# Bounds for optimization (V)
+# Voltage bounds for each controllable electrode (used in optimization)
 BOUNDS = dict(
     gate=(-GATE_MAX_BY_ANODE, GATE_MAX_BY_ANODE),
     cath=(-5000.0, 2000.0),
@@ -70,7 +78,20 @@ BOUNDS = dict(
     pmt_bot=(-1100.0, -900.0)
 )
 
-# Mapping from index (in the basis file) to electrode name
+def basis_support_mask(Bstack, thresh=1e-9):
+    """
+    Returns a boolean mask identifying the spatial region
+    where the total field magnitude from all basis components
+    is significant (> thresh).
+    """
+    Er = Bstack['Er']; Ez = Bstack['Ez']
+
+    # Compute the total norm for all basis fields with 1 V applied
+    S = np.sum(np.hypot(Er, Ez), axis=0)   # (Nz, Nr)
+    return S > float(thresh)
+
+
+# Mapping from basis index (as stored in COMSOL output) to electrode name
 IDX2NAME = {
     1: 'cath',
     2: 'gate',
@@ -86,8 +107,11 @@ IDX2NAME = {
     12:'ring_7',
 }
 
+# Z-positions of key electrodes (for plotting / visualization)
 Z_CATH = -15.95e-3
 Z_GATE = +14.05e-3
+
+# Z positions of field-shaping rings (from bottom to top)
 RING_Z = {
     'ring_7': -12.45e-3,
     'ring_6': -8.45e-3,
@@ -98,21 +122,55 @@ RING_Z = {
     'ring_1': +11.55e-3,   # near gate
 }
 
+# Step between rings (in mm) — used for auto-generation if needed
+_step = 24.0/7.0  # mm
+
+# Manual list of ring positions considering another RING: 
+_ring_mm = [
+    -12.45,                               # ring_8 (closest to cathode)
+    -12.45 + _step,                       # ring_7
+    -12.45 + 2*_step,                     # ring_6
+    -12.45 + 3*_step,                     # ring_5
+    -12.45 + 4*_step,                     # ring_4
+    -12.45 + 5*_step,                     # ring_3
+    -12.45 + 6*_step,                     # ring_2
+    +11.55                                # ring_1 (near gate)
+]
+
+#RING_Z = {
+#    'ring_8': _ring_mm[0]*1e-3,
+#    'ring_7': _ring_mm[1]*1e-3,
+#    'ring_6': _ring_mm[2]*1e-3,
+#    'ring_5': _ring_mm[3]*1e-3,
+#    'ring_4': _ring_mm[4]*1e-3,
+#    'ring_3': _ring_mm[5]*1e-3,
+#    'ring_2': _ring_mm[6]*1e-3,
+#    'ring_1': _ring_mm[7]*1e-3,
+#}
+
 
 
 # Radial binning settings
-NR_BINS = 100
-RMAX_FOR_BIN = ROI_R[1]
+NR_BINS = 100                 # Number of radial bins (used for rebinning E-field)
+RMAX_FOR_BIN = ROI_R[1]       # Maximum radius for analysis
 
 def _auto_cache_name(path_csv, Nr, rmax):
+    """
+    Helper to generate a cache filename automatically based on
+    the original basis file, number of radial bins, and rmax (in mm).
+    """
     base = os.path.splitext(os.path.basename(path_csv))[0]
     rmm = int(round(rmax * 1e3))
     return f"basis_cache_{base}_Nr{Nr}_R{rmm}mm.npz"
 
+
+# Cached version of preprocessed data
 CACHE_NPZ = _auto_cache_name(PATH_BASIS, NR_BINS, RMAX_FOR_BIN)
 
+# ============================================================
+# 2. UTILITY FUNCTIONS
+# ============================================================
 
-# ============== Helper functions ==============
 def read_with_commented_header(path):
     """
     Reads a CSV file ignoring lines starting with '%'.
@@ -125,6 +183,7 @@ def read_with_commented_header(path):
         for line in f:
             s = line.strip()
             if s.startswith('%') and ',' in s and ('Ex (V/m)' in s or 'Ey (V/m)' in s or 'Ez (V/m)' in s):
+                # Extract column names from the commented header
                 names = [t.strip().lstrip('%').strip() for t in s.split(',')]
                 break
     if names:
@@ -134,7 +193,8 @@ def read_with_commented_header(path):
 
 def _pick(df, *cands):
     """
-    Returns the first column in `df` whose name matches any candidate in `cands`.
+    Returns the first column name found in DataFrame `df`
+    that matches any of the candidate names in `cands`.
     """
     for c in cands:
         if c in df.columns:
@@ -143,13 +203,16 @@ def _pick(df, *cands):
 
 def _pick_field_vcomp(df, which='Ex'):
     """
-    Finds a column containing a specific electric field component (Ex, Ey, Ez),
-    even if it has a prefix (e.g., 'es2.Ex (V/m)').
+    Finds a column name containing a specific E-field component (Ex, Ey, Ez),
+    even if the name includes a COMSOL prefix, e.g., 'es2.Ex (V/m)'.
+
+    Returns the column name or None if not found.
     """
     tail = f"{which} (V/m)"
     for col in df.columns:
         if str(col).strip().endswith(tail):
             return col
+    # Regex match (for non-standard names)
     pat = re.compile(rf"(^|[.\s_]){which}($|[\s(])", re.IGNORECASE)
     for col in df.columns:
         if pat.search(str(col)):
@@ -158,8 +221,8 @@ def _pick_field_vcomp(df, which='Ex'):
 
 def _to_m_if_mm(arr_like):
     """
-    Converts from mm to m if typical values are > 0.5 (assuming cm scale).
-    Leaves values unchanged if they are already in meters.
+    Converts an array from mm to m if typical values are larger than 0.5,
+    assuming they are in mm or cm. Otherwise, leaves values unchanged.
     """
     a = np.asarray(arr_like, dtype=float)
     if np.nanpercentile(np.abs(a), 90) > 0.5:
@@ -168,7 +231,8 @@ def _to_m_if_mm(arr_like):
 
 def _unit_phi(x, y):
     """
-    Given x and y, returns (cos(phi), sin(phi), phi) for the azimuthal angle phi.
+    Given Cartesian coordinates (x, y), returns
+    (cos(phi), sin(phi), phi) where phi is the azimuthal angle.
     """
     phi = np.arctan2(y, x)
     return np.cos(phi), np.sin(phi), phi
@@ -183,16 +247,6 @@ def _bin_to_r_grid(df_slice, Nr, rmax):
     """
     Performs radial binning at a fixed z position.
     Uses uniform binning in r² to avoid undersampling near the center.
-    
-    Parameters:
-        df_slice : DataFrame with columns ['r','Er','Ez'] at fixed z
-        Nr       : number of radial bins
-        rmax     : maximum radius (m)
-    
-    Returns:
-        r_centers : radial bin centers (m)
-        Er_b      : averaged Er per bin
-        Ez_b      : averaged Ez per bin
     """
     edges = _edges_uniform_r2(rmax, Nr)
     idx = np.clip(np.digitize(df_slice['r'].values, edges) - 1, 0, Nr-1)
@@ -207,20 +261,26 @@ def _bin_to_r_grid(df_slice, Nr, rmax):
     return r_centers, Er_b, Ez_b
 
 def median_signed_Ez(Ez, mask):
+    """
+    Computes the median value of Ez inside a given mask,
+    excluding NaNs and non-finite entries.
+    """
     vals = Ez[mask]
     vals = vals[np.isfinite(vals)]
     return float(np.median(vals)) if vals.size else 0.0
 
+# ============================================================
+# 3. BASIS AND DIRECT FIELD LOADERS
+# ============================================================
 
-# ============== Basis loader (cartesian 3D → cylindrical r,z grids) ==============
 def load_basis_cartesian(path, Nr=NR_BINS, rmax=RMAX_FOR_BIN):
     """
-    Loads unit-field CSV (1 V per electrode), converts to cylindrical (r, Er, Ez),
-    and aggregates onto a common r-grid (uniform in r^2) for each z-level and electrode.
+    Loads a COMSOL 'unit-field' CSV (1 V applied to each electrode),
+    converts it to cylindrical coordinates (r, Er, Ez),
+    and rebins data into a uniform radial grid (uniform in r²).
 
-    Returns:
-        basis: dict mapping electrode -> {r, z, Er(Nz,Nr), Ez(Nz,Nr)}
-               where r and z are shared across electrodes.
+    The output is organized by electrode name and can be used
+    to reconstruct the total electric field by linear superposition.
     """
     df = read_with_commented_header(path).rename(columns=lambda s: str(s).strip())
 
@@ -297,23 +357,21 @@ def load_basis_cartesian(path, Nr=NR_BINS, rmax=RMAX_FOR_BIN):
 
     return out
 
+# ============================================================
+# 4. DIRECT FIELD LOADERS (from full-bias COMSOL simulations)
+# ============================================================
+
 from scipy.interpolate import griddata
 
 def load_direct_on_basis_grid_interp(path, Bstack, rmax=RMAX_FOR_BIN):
     """
     Loads a direct COMSOL CSV (all electrodes biased simultaneously),
-    converts to cylindrical, and interpolates (Er, Ez) onto the basis (r,z) grid.
-
-    Strategy:
-      - Use linear interpolation where available.
-      - Fill remaining NaNs with nearest-neighbour.
-      - Report coverage diagnostics.
-
-    Returns:
-        dict(r, z, Er, Ez) aligned to Bstack['r'], Bstack['z'].
+    converts to cylindrical coordinates, and interpolates (Er, Ez)
+    onto the r-z grid defined by the basis stack (Bstack).
     """
     df = read_with_commented_header(path).rename(columns=lambda s: str(s).strip())
 
+    # Identify required columns
     xcol = _pick(df, 'x (mm)', 'x')
     ycol = _pick(df, 'y (mm)', 'y')
     zcol = _pick(df, 'z (mm)', 'z')
@@ -322,7 +380,7 @@ def load_direct_on_basis_grid_interp(path, Bstack, rmax=RMAX_FOR_BIN):
     Ez   = _pick_field_vcomp(df, 'Ez')
     assert all([xcol, ycol, zcol, Ex, Ey, Ez]), "Missing columns in direct CSV."
 
-    # data (mm→m if needed)
+    # Convert and sanitize numeric data
     x = _to_m_if_mm(df[xcol].astype(float).values)
     y = _to_m_if_mm(df[ycol].astype(float).values)
     z = _to_m_if_mm(df[zcol].astype(float).values)
@@ -330,105 +388,51 @@ def load_direct_on_basis_grid_interp(path, Bstack, rmax=RMAX_FOR_BIN):
     ey = df[Ey].astype(float).values
     ez = df[Ez].astype(float).values
 
-    # cylindrical
+    # Cylindrical transformation
     phi = np.arctan2(y, x); c = np.cos(phi); s = np.sin(phi)
     r  = np.sqrt(x*x + y*y)
     er = ex*c + ey*s
 
-    # filter domain
+    # Keep only finite and valid domain points
     m = np.isfinite(r) & np.isfinite(z) & np.isfinite(er) & np.isfinite(ez) & (r <= rmax)
     r, z, er, ez = r[m], z[m], er[m], ez[m]
 
-    # target grid from basis
+    # Target (r,z) grid from basis
     r_grid = np.asarray(Bstack['r'], dtype=float)
     z_grid = np.asarray(Bstack['z'], dtype=float)
     Rg, Zg = np.meshgrid(r_grid, z_grid)  # (Nz, Nr)
 
     pts = np.column_stack([r, z])
 
-    # linear interpolation (inside convex hull)
+    # Interpolate Er, Ez using linear and nearest methods
     Er_lin = griddata(pts, er, (Rg, Zg), method='linear')
     Ez_lin = griddata(pts, ez, (Rg, Zg), method='linear')
-
-    # nearest fill for holes (outside hull / sparse regions)
     Er_near = griddata(pts, er, (Rg, Zg), method='nearest')
     Ez_near = griddata(pts, ez, (Rg, Zg), method='nearest')
 
+    # Fill NaNs from linear interpolation with nearest-neighbor values
     Er = np.where(np.isfinite(Er_lin), Er_lin, Er_near).astype(np.float32)
     Ez = np.where(np.isfinite(Ez_lin), Ez_lin, Ez_near).astype(np.float32)
 
-    # simple diagnostics
+    # Diagnostic printout
     lin_cov = np.isfinite(Er_lin).mean()
-    print(f"[INFO] Direct→basis interpolation: linear coverage {100*lin_cov:.1f}% (rest filled with nearest).")
+    print(f"[INFO] Direct-basis interpolation: linear coverage {100*lin_cov:.1f}% (rest filled with nearest).")
 
     return dict(r=r_grid.astype(np.float32), z=z_grid.astype(np.float32), Er=Er, Ez=Ez)
 
-# ============== Direct loader (cartesian 3D → cylindrical, rebinned) ==============
-def load_direct_cartesian(path, Nr=NR_BINS, rmax=RMAX_FOR_BIN):
-    """
-    Loads a direct COMSOL CSV (all electrodes biased), converts to cylindrical,
-    and bins onto a common r-grid (uniform in r^2) at each available z-level.
 
-    Note:
-        z-levels must match (or be compatible with) the basis if you plan to
-        compare element-wise. Otherwise, prefer `load_direct_on_basis_grid_interp`.
-    """
-    df = read_with_commented_header(path).rename(columns=lambda s: str(s).strip())
+# ============================================================
+# 5. CACHE AND FAST FIELD SUPERPOSITION
+# ============================================================
 
-    xcol = _pick(df, 'x (mm)', 'x')
-    ycol = _pick(df, 'y (mm)', 'y')
-    zcol = _pick(df, 'z (mm)', 'z')
-    Ex   = _pick_field_vcomp(df, 'Ex')
-    Ey   = _pick_field_vcomp(df, 'Ey')
-    Ez   = _pick_field_vcomp(df, 'Ez')
-    assert all([xcol, ycol, zcol, Ex, Ey, Ez]), "Missing columns in direct CSV."
-
-    # to float
-    df['x']  = df[xcol].astype(float)
-    df['y']  = df[ycol].astype(float)
-    df['z']  = df[zcol].astype(float)
-    df['Ex'] = df[Ex].astype(float)
-    df['Ey'] = df[Ey].astype(float)
-    df['Ez'] = df[Ez].astype(float)
-    df = df.dropna(subset=['Ex','Ey','Ez'])
-
-    # mm → m if needed
-    df['x'] = _to_m_if_mm(df['x'].values)
-    df['y'] = _to_m_if_mm(df['y'].values)
-    df['z'] = _to_m_if_mm(df['z'].values)
-
-    # cylindrical
-    c, s, _ = _unit_phi(df['x'].values, df['y'].values)
-    df['r']  = np.sqrt(df['x'].values**2 + df['y'].values**2)
-    df['Er'] = df['Ex'].values*c + df['Ey'].values*s
-
-    # grids
-    z_levels = np.sort(df['z'].unique())
-    r_edges = _edges_uniform_r2(rmax, Nr)
-    r_grid  = 0.5 * (r_edges[:-1] + r_edges[1:])
-
-    Er_mat = np.zeros((len(z_levels), Nr), dtype=np.float32)
-    Ez_mat = np.zeros_like(Er_mat)
-
-    for i, z0 in enumerate(z_levels):
-        sli = df[df['z'] == z0][['r', 'Er', 'Ez']]
-        sli = sli[sli['r'] <= rmax]
-        if sli.empty:
-            Er_mat[i, :] = 0.0
-            Ez_mat[i, :] = 0.0
-            continue
-        _, Er_b, Ez_b = _bin_to_r_grid(sli, Nr, rmax)
-        Er_mat[i, :] = Er_b.astype(np.float32)
-        Ez_mat[i, :] = Ez_b.astype(np.float32)
-
-    return dict(r=r_grid.astype(np.float32), z=z_levels.astype(np.float32), Er=Er_mat, Ez=Ez_mat)
-
-
-# ================= Cache and Fast Field Superposition =================
-
-CACHE_VERSION = 2  # súbelo si cambias el formato
+CACHE_VERSION = 2
 
 def build_basis_cache(path_csv, Nr=NR_BINS, rmax=RMAX_FOR_BIN, cache=CACHE_NPZ):
+    """
+    Builds and saves a compressed cache (.npz) of all basis field maps.
+    The cache speeds up future reloads by storing the r,z grids and
+    all (Er, Ez) matrices in binary format.
+    """
     basis = load_basis_cartesian(path_csv, Nr=Nr, rmax=rmax)
     names = sorted(basis.keys())
     r = basis[names[0]]['r'].astype(np.float32)
@@ -445,26 +449,31 @@ def build_basis_cache(path_csv, Nr=NR_BINS, rmax=RMAX_FOR_BIN, cache=CACHE_NPZ):
         rmax=float(rmax),
         names=list(names),
     )
-    # np.savez no guarda dicts directamente; lo metemos como objeto
+    # np.savez_compressed cannot store dicts directly, so meta is stored as an object
     np.savez_compressed(cache,
                         names=np.array(names),
                         r=r, z=z, Er=Er, Ez=Ez,
                         meta=np.array([meta], dtype=object))
     return dict(names=names, r=r, z=z, Er=Er, Ez=Ez)
 
-def load_basis_cache(path_csv, Nr=NR_BINS, rmax=RMAX_FOR_BIN, cache=CACHE_NPZ, force_rebuild=False):
+def load_basis_cache(path_csv, Nr=NR_BINS, rmax=RMAX_FOR_BIN, cache=CACHE_NPZ, force_rebuild=False, trust_cache=True):
+    """
+    Loads the cached basis file if valid; otherwise rebuilds it.
+    Metadata are checked (version, Nr, rmax, file size, modification time)
+    to ensure consistency with the original CSV.
+    """
     def _ok_meta(npz):
         if 'meta' not in npz.files:
             return False
         meta = npz['meta'].item()
         if meta.get('version') != CACHE_VERSION:
             return False
-        # coherencia básica
+        # Consistency checks
         if int(meta.get('Nr', -1)) != int(Nr):
             return False
         if abs(float(meta.get('rmax', -1.0)) - float(rmax)) > 1e-9:
             return False
-        # coherencia con el CSV origen (mtime/size)
+        # Compare with CSV source file
         if os.path.exists(path_csv):
             try:
                 if abs(meta.get('mtime', -1.0) - os.path.getmtime(path_csv)) > 1e-6:
@@ -477,28 +486,23 @@ def load_basis_cache(path_csv, Nr=NR_BINS, rmax=RMAX_FOR_BIN, cache=CACHE_NPZ, f
 
     if (not force_rebuild) and os.path.exists(cache):
         npz = np.load(cache, allow_pickle=True, mmap_mode='r')
-        if _ok_meta(npz):
+        if trust_cache or _ok_meta(npz):   
+            # Return cached data directly
             return dict(names=list(npz['names']), r=npz['r'], z=npz['z'],
                         Er=npz['Er'], Ez=npz['Ez'])
         else:
-            try:
+            # Rebuild if cache is outdated
+            try: 
                 os.remove(cache)
-            except Exception:
-                pass  # si no podemos borrar, lo sobrescribimos luego
+            except Exception: 
+                pass
 
-    # (re)construye
     return build_basis_cache(path_csv, Nr=Nr, rmax=rmax, cache=cache)
 
 def superpose_fast(Bstack, Vdict):
     """
-    Superpose electrode basis fields with given electrode voltages.
-
-    Parameters:
-        Bstack (dict): Contains 'names', 'r', 'z', 'Er', 'Ez'.
-        Vdict (dict): Electrode voltages {electrode_name: voltage_value}.
-
-    Returns:
-        tuple: (r, z, Er_total, Ez_total)
+    Compute the total electric field by superposing all unit-field maps
+    according to the voltage configuration provided in Vdict.
     """
     names = Bstack['names']
     weights = np.array([Vdict.get(n, 0.0) for n in names], dtype=np.float32)  # (Ne,)
@@ -506,10 +510,14 @@ def superpose_fast(Bstack, Vdict):
     Ez_total = np.tensordot(weights, Bstack['Ez'], axes=1)  # (Nz, Nr)
     return Bstack['r'], Bstack['z'], Er_total, Ez_total
 
-# ================= ROI, Field Metrics, Voltage Setup =================
+
+# ============================================================
+# 6. ROI, FIELD METRICS AND VOLTAGE SETUP
+# ============================================================
+
 def roi_mask(r, z, rmin, rmax, zmin, zmax):
     """
-    Create a boolean mask for points inside a cylindrical ROI.
+    Generate a boolean mask for points within a cylindrical ROI.
     """
     R, Z = np.meshgrid(r, z)
     return (R >= rmin) & (R <= rmax) & (Z >= zmin) & (Z <= zmax)
@@ -517,7 +525,8 @@ def roi_mask(r, z, rmin, rmax, zmin, zmax):
 
 def list_rings_from_basis(basis_like):
     """
-    Return ordered list of ring electrode names from basis.
+    Returns the list of ring electrode names (ring_1, ring_2, ...)
+    sorted in ascending numerical order.
     """
     if isinstance(basis_like, dict) and 'names' in basis_like:
         names = basis_like['names']
@@ -528,59 +537,73 @@ def list_rings_from_basis(basis_like):
 
 def Vdict_for_E(gate_voltage=0.0, pmt_top=None, pmt_bottom=None,
                 include_rings=True, basis_like=None, ring_positions=None):
+    """
+    Build a complete voltage configuration dictionary for all electrodes.
+
+    The resulting dictionary can be directly passed to `superpose_fast`
+    to compute the total electric field for a given configuration.
+    """
     cathode_voltage = -4000.0
     anode_voltage   = gate_voltage + EXTRACTION
     V = dict(gate=gate_voltage, cath=cathode_voltage, anode=anode_voltage)
 
+    # Optional PMT voltages
     if pmt_top is not None:
         V['pmt_top'] = pmt_top
     if pmt_bottom is not None:
         V['pmt_bot'] = pmt_bottom
 
+    # Add voltages for field-shaping rings
     if include_rings and basis_like is not None:
         ring_names = list_rings_from_basis(basis_like)
         if ring_positions is not None:
-            # Ladder por posición real (recomendado)
+            # Use actual z positions to interpolate between cathode and gate
             V.update(rings_from_positions(cathode_voltage, gate_voltage,
                                           ring_names, ring_positions,
                                           z_cath=Z_CATH, z_gate=Z_GATE))
         else:
-            # Fallback: rampa uniforme por índice (sólo si spacing ideal)
+            # Fallback: use a simple uniform ladder (only valid for ideal ring spacing)
             n = len(ring_names)
             step = (gate_voltage - cathode_voltage) / (n + 1) if n > 0 else 0.0
             for i, name in enumerate(ring_names, start=1):
-                # ring_1 es el más cercano al gate
+                # ring_1 is closest to the gate
                 i_rev = (n + 1) - i
                 V[name] = cathode_voltage + i_rev * step
     return V
 
 def rings_from_positions(Vcath, Vgate, ring_names, ring_z, z_cath=Z_CATH, z_gate=Z_GATE):
+    """
+    Interpolate ring voltages between cathode and gate
+    based on their physical z positions.
+    """
     L = float(z_gate - z_cath)
     out = {}
-    # Asegura orden claro: de abajo (cerca cátodo) a arriba (cerca gate)
+
+    # Sort by position (bottom -> top)
     names_sorted = sorted(ring_names, key=lambda n: ring_z[n])
     for name in names_sorted:
         zi = float(ring_z[name])
-        t = (zi - z_cath) / L  # 0 en cátodo, 1 en gate
+        t = (zi - z_cath) / L        # Normalized 0..1 coordinate between cathode and gate
         out[name] = Vcath + t * (Vgate - Vcath)
     return out
 
 
 def segment_weights_from_positions(ring_names, ring_z, z_cath=Z_CATH, z_gate=Z_GATE):
     """
-    Devuelve:
-      - names_bottom_up: anillos de abajo (cerca cátodo) a arriba (cerca gate)
-      - w: array de longitudes de los (n+1) tramos: [cath→r7, r7→r6, ..., r1→gate]
+    Compute relative segment lengths (weights) between cathode, rings, and gate.
     """
-    names_bottom_up = sorted(ring_names, key=lambda n: ring_z[n])  # z creciente
+    names_bottom_up = sorted(ring_names, key=lambda n: ring_z[n])  # increasing z
     zs = [z_cath] + [ring_z[n] for n in names_bottom_up] + [z_gate]
     w = np.diff(zs)  # (n+1,)
     return names_bottom_up, np.asarray(w, float)
 
 def rings_from_segment_weights(Vc, Vg, names_bottom_up, w):
+    """
+    Compute ring voltages from relative segment weights.
+    """
     w = np.clip(np.asarray(w, float), 1e-12, None)
-    t_nodes = np.cumsum(w) / np.sum(w)            # fracción 0..1 en cada nodo
-    t_rings = t_nodes[:-1]                        # excluye el nodo 'gate'
+    t_nodes = np.cumsum(w) / np.sum(w)        # normalized fraction 0..1 per node          
+    t_rings = t_nodes[:-1]                    # exclude final 'gate' node              
     out = {}
     for name, t in zip(names_bottom_up, t_rings):
         out[name] = Vc + t * (Vg - Vc)
@@ -589,30 +612,27 @@ def rings_from_segment_weights(Vc, Vg, names_bottom_up, w):
 
 def ring_weights_uniform_plus_top(ring_names, top_factor=1.0):
     """
-    Devuelve el vector de pesos (n_rings+1) para rings_from_positions
-    dejando TODOS los tramos uniformes (=1) salvo el penúltimo
-    (entre ring_2 -> ring_1), que se multiplica por 'top_factor'.
-
-    Notas:
-      - ring_1 es el más cercano al gate (como en tu código).
-      - El último peso (hueco ring_1 -> gate) se deja en 1.0 para que
-        sólo cambie la posición de ring_1 respecto a la rampa uniforme.
+    Create a set of segment weights for `rings_from_positions`,
+    where all segments are uniform (=1) except the one just below the gate
+    (ring_2 → ring_1), which is scaled by `top_factor`.
     """
     n = len(ring_names)
     if n == 0:
         return np.array([1.0], float)
 
-    w = np.ones(n + 1, dtype=float)   # n tramos entre anillos + 1 tramo hasta gate
-    w[n - 1] = max(1e-4, float(top_factor))  # tramo ring_2 -> ring_1
+    w = np.ones(n + 1, dtype=float)   # n segments + 1 up to gate
+    w[n - 1] = max(1e-4, float(top_factor))  # adjust second-to-last segment
     return w
 
 
-
+# ============================================================
+# 7. FIELD METRICS AND QUALITY INDICATORS
+# ============================================================
 
 def median_gas_field_from_V(Bstack, V, roi_gas):
     """
-    Compute median electric field in the gas region for a given voltage setup.
-    Returns field in kV/cm.
+    Compute the median |Ez| field in the gas (GXe) region for a given voltage setup.
+    The result is returned in kV/cm.
     """
     r, z, Er, Ez = superpose_fast(Bstack, V)
     Mgas = roi_mask(r, z, *roi_gas)
@@ -620,55 +640,32 @@ def median_gas_field_from_V(Bstack, V, roi_gas):
     return (np.nanmedian(Ez_abs) / 1e5) if Ez_abs.size else np.nan
 
 
-def p90_absE(Er, Ez, mask):
-    """P90 de |E| en una banda (detecta hotspots)."""
-    idx = np.where(mask)
-    if idx[0].size == 0: return 0.0
-    E = np.hypot(Er[idx], Ez[idx])
-    E = E[np.isfinite(E)]
-    return float(np.quantile(E, 0.90)) if E.size else 0.0
-
 def frac_reversed(Ez, mask, expected_sign=-1):
-    """Fracción de puntos con signo de Ez contrario al esperado (campo 'reverso')."""
+    """
+    Fraction of points within the ROI where Ez has the opposite sign
+    to the expected drift direction (indicates field reversal).
+    """
     idx = np.where(mask)
     if idx[0].size == 0: return 0.0
     vals = Ez[idx]; vals = vals[np.isfinite(vals)]
     if vals.size == 0: return 0.0
     return float(np.mean(np.sign(vals) != expected_sign))
 
-def p90_ratio_band(Er, Ez, mask):
-    """P90 de Er/Ez en una banda (mide 'fuga' transversal)."""
-    idx = np.where(mask)
-    if idx[0].size == 0: return 0.0
-    Erb = np.abs(Er[idx]); Ezb = np.abs(Ez[idx])
-    if Erb.size == 0: return 0.0
-    floor = max(1.0, np.percentile(Ezb, 10))
-    r = Erb / np.clip(Ezb, floor, None)
-    r = r[np.isfinite(r)]
-    return float(np.quantile(r, 0.90)) if r.size else 0.0
 
-
-
-
-# ========================= PLOTS =========================
+# ============================================================
+# 8. PLOTTING FUNCTIONS
+# ============================================================
 
 def plot_diff_map(Bstack, Vdict, direct, roi_lxe=None, full_extent=False,
-                  r2_max_cm2=None, out='diff_map_8.png'):
+                  r2_max_cm2=None, out='diff_map.png'):
     """
-    Plot |E_sup - E_dir| / |E_dir| on the (r^2, z) plane.
-
-    Args:
-        Bstack: basis stack dict used by superpose_fast.
-        Vdict:  voltage map for the superposition.
-        direct: dict(r, z, Er, Ez) on the SAME grid as Bstack (or already interpolated).
-        roi_lxe: (rmin, rmax, zmin, zmax) to optionally crop and draw dashed lines.
-        full_extent: if True, ignore roi crop (still can draw dashed lines if roi_lxe provided).
-        r2_max_cm2: if set, additionally crop r by sqrt(r2_max_cm2)/100 m.
-        out: output PNG filename.
+    Plot the relative deviation map between superposed and direct COMSOL fields:
+    |E_superposed - E_direct| / |E_direct| on the (r², z) plane.
     """
     r, z, Er, Ez = superpose_fast(Bstack, Vdict)
     Er_d, Ez_d   = direct['Er'], direct['Ez']
 
+    # Compute relative error
     num = np.sqrt((Er - Er_d)**2 + (Ez - Ez_d)**2)
     den = np.sqrt(Er_d**2 + Ez_d**2)
 
@@ -680,7 +677,7 @@ def plot_diff_map(Bstack, Vdict, direct, roi_lxe=None, full_extent=False,
     keep = valid & (den > eps)
     Q[keep] = num[keep] / den[keep]
 
-    # Optional crop to ROI just for display (and axes limits)
+    # Optionally crop to ROI for display
     r_show, z_show, Q_show = r, z, Q
     if (roi_lxe is not None) and (not full_extent):
         rmin, rmax, zmin, zmax = roi_lxe
@@ -690,14 +687,14 @@ def plot_diff_map(Bstack, Vdict, direct, roi_lxe=None, full_extent=False,
         cols = np.where(np.any(M, axis=0))[0]
         z_show = z[rows]; r_show = r[cols]; Q_show = Q[np.ix_(rows, cols)]
 
-    # Optional crop by r^2 max (in cm^2)
+    # Optional crop by r² max (in cm²)
     if r2_max_cm2 is not None:
         r_cut = (r2_max_cm2**0.5)/100.0
         keep_r = r_show <= r_cut
         r_show = r_show[keep_r]
         Q_show = Q_show[:, keep_r]
 
-    # Build extent in (r^2[cm^2], z[cm])
+    # Build plot extent in (r² [cm²], z [cm])
     R2 = (np.meshgrid(r_show, z_show)[0]**2) * 1e4
     extent = [np.nanmin(R2), np.nanmax(R2), np.nanmin(z_show)*100, np.nanmax(z_show)*100]
 
@@ -708,7 +705,7 @@ def plot_diff_map(Bstack, Vdict, direct, roi_lxe=None, full_extent=False,
                     norm=LogNorm(vmin=1e-4, vmax=2e-1))
     im.cmap.set_bad(im.cmap(0.0), 1.0)
 
-    # Draw dashed lines at LXe ROI if provided
+     # Draw dashed lines for the LXe ROI
     if roi_lxe is not None:
         _, _, zmin, zmax = roi_lxe
         plt.hlines([zmin*100, zmax*100], extent[0], extent[1],
@@ -723,10 +720,10 @@ def plot_diff_map(Bstack, Vdict, direct, roi_lxe=None, full_extent=False,
     plt.close()
 
 
-def plot_optimal(df, out='optimal_voltages_vs_E_3D_2_8.png'):
+def plot_optimal(df, out='optimal_voltages_vs_E_3D_2.png'):
     """
-    Plot optimal (Vcath, Vgate, Vanode) vs target median drift field,
-    along with median amplification field in GXe if provided (Egas_kVcm).
+    Plot optimal (Vcath, Vgate, Vanode) vs. target median drift field,
+    including optional median extraction field in GXe (Egas_kVcm).
     """
     fig, ax = plt.subplots(figsize=(5.9, 3.9))
     ax.plot(df['Ecm'], df['V_cath']/1e3, label=r'$U_{\mathrm{cathode}}$')
@@ -737,8 +734,10 @@ def plot_optimal(df, out='optimal_voltages_vs_E_3D_2_8.png'):
 
     if 'Egas_kVcm' in df.columns and np.any(np.isfinite(df['Egas_kVcm'])):
         ax2 = ax.twinx()
-        ax2.plot(df['Ecm'], df['Egas_kVcm'], ls='--')
-        ax2.set_ylabel('Median amplification field [kV/cm]')
+        ax2.plot(df['Ecm'], df['Egas_kVcm'], ls='--', color='red')
+        ax2.set_ylabel('Extraction field [kV/cm]', color='red')
+        ax2.tick_params(axis='y', labelcolor='red')
+
 
     fig.legend(loc='upper left', bbox_to_anchor=(0.12, 0.98))
     fig.tight_layout()
@@ -746,9 +745,17 @@ def plot_optimal(df, out='optimal_voltages_vs_E_3D_2_8.png'):
     plt.close(fig)
 
 
-def plot_deviation(df, out='deviation_vs_E_3D_2_8.png'):
+def plot_deviation(df, out='deviation_vs_E_3D_2.png'):
+    """
+    Plot deviation metrics (mean of |Er/Ez|) vs. median drift field.
+    Useful to visualize field uniformity across drift region.
+    """
+    ycol = 'mean' if 'mean' in df.columns else None
+    if ycol is None:
+        print("[WARN] plot_deviation: no 'mean' or 'mean' found in DataFrame; skipping plot.")
+        return
     plt.figure(figsize=(5.8, 3.6))
-    plt.semilogy(df['Ecm'], 100*df['p90'], label=r'$100\times \tan(p90(\theta))$ in LXe')
+    plt.semilogy(df['Ecm'], 100*df[ycol], label='mean: $|E_r|/|E_z|$ (LXe)')
     plt.xlabel('Median drift field [V/cm]')
     plt.ylabel('Deviation [%]')
     plt.grid(True, which='both', ls=':')
@@ -757,28 +764,32 @@ def plot_deviation(df, out='deviation_vs_E_3D_2_8.png'):
     plt.savefig(out, dpi=180)
     plt.close()
 
-def plot_deflection(df, out='deflection_vs_E_8.png'):
-    if 'deflect_p90_mm' not in df.columns: return
+
+def plot_deflection(df, out='deflection_vs_E.png'):
+    """
+    Plot drift deflection [mm] vs. median drift field.
+    """
+    if 'deflect_mean_mm' not in df.columns: return
     plt.figure(figsize=(5.8, 3.6))
-    plt.plot(df['Ecm'], df['deflect_p90_mm'])
+    plt.plot(df['Ecm'], df['deflect_mean_mm'])
     plt.xlabel('Median drift field [V/cm]')
-    plt.ylabel('Drift deflection p90 [mm]')
+    plt.ylabel('Drift deflection mean [mm]')
     plt.grid(True, ls=':')
     plt.tight_layout()
     plt.savefig(out, dpi=180)
     plt.close()
 
 
+# ============================================================
+# 9. OPTIMIZATION (Single Source of Truth)
+# ============================================================
 
-# ================== OPTIMIZATION (single source of truth) ==================
 import numpy as np
 from scipy.optimize import minimize
 
 def drift_metrics_rel(Er, Ez, mask):
     """
-    Like drift_metrics, but the Ez floor is tied to the actual median Ez,
-    avoiding artificially inflating Ez to shrink Er/Ez.
-    Returns: (median_Ez, p90_ratio, inhomogeneity)
+    Compute integral field metrics within a ROI mask.
     """
     idx = np.where(mask)
     if idx[0].size == 0:
@@ -792,88 +803,94 @@ def drift_metrics_rel(Er, Ez, mask):
 
     Ez_abs = np.abs(Ez_sel); Er_abs = np.abs(Er_sel)
     Ed_med = float(np.median(Ez_abs))
+
+    # Numerical floor to prevent division by tiny Ez
     floor  = max(0.05*Ed_med, float(np.percentile(Ez_abs,10)), 1.0)
     ratio  = Er_abs / np.clip(Ez_abs, floor, None)
-    p90    = float(np.quantile(ratio, 0.90))
-    inhEz  = float(np.quantile(np.abs(Ez_abs-Ed_med)/max(Ed_med,1.0), 0.68))
-    return Ed_med, p90, inhEz
+    ratio_mean = float(np.nanmean(ratio))
+
+    # RMS of Ez relative to median (field homogeneity indicator)
+    rel = (Ez_abs - Ed_med) / max(Ed_med, 1.0)
+    inh_rms = float(np.sqrt(np.nanmean(rel**2)))
+
+    return Ed_med, ratio_mean, inh_rms
 
 
 def solve_cathode_for_E0(
     Bstack, Vg, extraction_V, mask_lxe, E0_Vm,
     base_V, ring_names, vmin, vmax,
     maxit=30, tol=50.0, ring_deltas=None,
-    drift_sign=-1,          # -1: Ez<0 en LXe
-    enforce_order=True,     # fuerza Vc < Vg
-    eps_order=10.0,         # margen mínimo (V)
-    enforce_sign=True,      # evita soluciones con signo de Ez incorrecto
-    eps_sign=25.0           # |Ez| mínimo (V/m) para considerar “con signo”
+    drift_sign=-1,          # -1 → Ez < 0 (downward drift in LXe)
+    enforce_order=True,     # ensure Vc < Vg (physical ordering)
+    eps_order=10.0,         # minimal voltage margin [V]
+    enforce_sign=True,      # avoid Ez sign inversion in ROI
+    eps_sign=25.0           # min |Ez| [V/m] to consider valid sign
 ):
     """
-    Resuelve Vc tal que mediana(Ez) ~= drift_sign * E0_Vm (en ROI_LXe),
-    forzando orden físico Vc < Vg y el signo del drift.
-    Devuelve (Vc_opt, hit_bound, Ed_median_signed).
+    Solve for cathode voltage (Vc) that achieves a target median field (E0_Vm)
+    in the liquid xenon region (LXe).
     """
     target = drift_sign * E0_Vm
 
     def Ed_of(Vc):
+        """Helper: compute median signed Ez for given Vc."""
         V = dict(base_V)
         V['gate']  = Vg
         V['cath']  = Vc
         V['anode'] = Vg + extraction_V
+
+        # Ring ladder configuration (segment-weighted or positional)
         if (ring_deltas is not None) and ring_names:
-            # ring_deltas son pesos -> convertir a voltajes mediante segmentos
             names_bu, w_pos = segment_weights_from_positions(ring_names, RING_Z, z_cath=Z_CATH, z_gate=Z_GATE)
-            # si ring_deltas es None usar w_pos; si viene, úsalo como pesos modificados
+         
             w_use = np.asarray(ring_deltas, float)
             if w_use.shape[0] != w_pos.shape[0]:
-                # protección: si no cuadra, usa posiciones reales
+                # If mismatch → fallback to geometric spacing
                 w_use = w_pos
             V.update(rings_from_segment_weights(Vc, Vg, names_bu, w_use))
         else:
-            # baseline por posición real (recomendado)
+           
             V.update(rings_from_positions(Vc, Vg, ring_names, RING_Z, z_cath=Z_CATH, z_gate=Z_GATE))
 
         _, _, Er, Ez = superpose_fast(Bstack, V)
         return median_signed_Ez(Ez, mask_lxe)
 
 
-    # Si pedimos orden físico, recorta el dominio de búsqueda
+    # Restrict upper bound if enforcing physical order
     if enforce_order:
         vmax = min(vmax, Vg - eps_order)
 
-    # Valores en extremos
+    # Evaluate field at search bounds
     Ea, Eb = Ed_of(vmin), Ed_of(vmax)
 
-    # Si el target no cae entre Ea y Eb, quédate con el extremo más cercano
+    # If target lies outside range, pick the nearest boundary
     if not (min(Ea, Eb) <= target <= max(Ea, Eb)):
         Vc_best = vmin if abs(Ea - target) < abs(Eb - target) else vmax
         Ed_best = Ed_of(Vc_best)
         hit = True
-        # si además el signo está mal y lo fuerzas, empuja hacia el lado correcto
+        # If sign mismatch, adjust toward physically valid side
         if enforce_sign and np.sign(Ed_best) != np.sign(target):
             Vc_best = vmax  # con orden físico ya es el lado “menos campo”
             Ed_best = Ed_of(Vc_best)
         return Vc_best, hit, Ed_best
 
-    # Bisección
+    # --- Bisection solver ---
     a, b, Ea, Eb = vmin, vmax, Ea, Eb
     for _ in range(maxit):
         m = 0.5*(a+b)
         Em = Ed_of(m)
         if abs(Em - target) < tol:
-            # chequeos finales de signo/orden
             hit = False
             if enforce_sign and (np.sign(Em) != np.sign(target) or abs(Em) < eps_sign):
                 hit = True
             return m, hit, Em
-        # avanza
+        # Update search interval
         if (Ea <= target <= Em) or (Em <= target <= Ea):
             b, Eb = m, Em
         else:
             a, Ea = m, Em
 
-    # salida tras maxit
+    # Return final midpoint after max iterations
     m = 0.5*(a+b); Em = Ed_of(m)
     hit = abs(Em - target) >= tol
     if enforce_sign and (np.sign(Em) != np.sign(target) or abs(Em) < eps_sign):
@@ -882,8 +899,8 @@ def solve_cathode_for_E0(
 
 def ring_weights_from_power_alpha(ring_names, alpha):
     """
-    Devuelve el vector de pesos (n_rings+1) tal que las posiciones de los anillos
-    siguen t_i**alpha, con t_i = (nR+1-i)/(nR+1), i=1..nR (ring_1 es el más cercano al gate).
+    Generate segment weights (n_rings+1) following a power-law spacing
+    controlled by exponent `alpha`. For alpha>1, rings cluster near the gate.
     """
     n = len(ring_names)
     if n == 0:
@@ -894,52 +911,71 @@ def ring_weights_from_power_alpha(ring_names, alpha):
     w = np.diff(np.r_[0.0, t[::-1], 1.0])
     return np.clip(w, 1e-6, None)
 
-
-
 def optimize_voltages_constrained(
     Bstack, E_targets_Vcm, roi_lxe,
     opt_pmts=False, opt_rings=False,
     lambda_inh=0.6, lambda_smooth=0.02,
     opt_offset=False, delta_bounds=(-1000.0, 1000.0),
     # --- novedades útiles ---
-    vg_seeds=(-2000.0, -1000.0, -300.0, -150.0, 0.0, +150.0, +300.0, +1000.0, 2000.0),  # multi-inicio en V_gate
-    leak_band_mm=(2.0, 0.2),      # banda ancha bajo gate: (alto, bajo) en mm
-    w_leak=1.20, w_hot=0.20, w_rev=0.10,  # pesos fuga/hot/reverse
-    soft_anchor_k=0.03,           # anclaje suave de Vc a PMT_bot
+    vg_seeds=(-2000.0, -1000.0, -300.0, -150.0, 0.0, +150.0, +300.0, +1000.0, 2000.0),
+    leak_band_mm=(2.0, 0.2),      
+    w_leak=0.05, w_hot=0.01, w_rev=0.01,  
     order_margin_V=0.0, metric='angle_bal', rings_top_factor= None, rings_power_alpha=None         
 ):
     """
-    L-BFGS-B estable:
-      - V_cath se resuelve por bisección (con orden físico y signo).
-      - Se usan varias semillas de V_gate y nos quedamos con la mejor.
-      - Penalizaciones “absolutas”:
-          * fuga (Er/Ez) bajo el gate, banda ancha
-          * hotspot y campo reverso bajo el cátodo (referencia PMT_bot)
-          * anclaje suave (Vc ~ V_PMT_bot) para romper gauge inferior
-      - ¡Sin premios por Vg=0!
+    Multi-start constrained voltage optimization using L-BFGS-B.
+
+    Strategy
+    --------
+    - For each target drift field E0, V_cath is solved analytically
+      (via bisection) to satisfy median(Ez) ≈ target.
+    - Gate voltage (and optionally PMTs/rings) are optimized numerically.
+    - Multiple gate voltage seeds are tested to avoid local minima.
+
+    Objective
+    ---------
+    Minimize:
+        mean(|Er|/|Ez|) + λ_inh * RMS(Ez/median(Ez))
+    plus additional penalties for:
+        - field reversals (wrong Ez sign)
+        - high-voltage constraint violations
+        - deviation from target E0
+    Returns
+    -------
+    DataFrame with optimal voltages and metrics for each E_target.
+
+    Notes
+    -----
+    - Physically enforces Vc < Vg < Vanode.
+    - All voltages are in [V]; fields in [V/cm].
     """
+
     r, z = Bstack['r'], Bstack['z']
     M_LXE = roi_mask(r, z, *roi_lxe)
 
-    # Bandas “absolutas”
+    # Define auxiliary ROIs for leakage and hotspot evaluation
     dz_hi, dz_lo = leak_band_mm[0]*1e-3, leak_band_mm[1]*1e-3
+    M_LXE  = roi_mask(Bstack['r'], Bstack['z'], *ROI_LXe)  & SUPPORT
     ROI_TOP_WIDE = (ROI_R[0], ROI_R[1], d_gate - dz_hi, d_gate - dz_lo)
-    M_TOP = roi_mask(r, z, *ROI_TOP_WIDE)
-    M_BELOW = roi_mask(r, z, *ROI_BELOW_CATH)
+    M_TOP = roi_mask(r, z, *ROI_TOP_WIDE) & SUPPORT
+    M_BELOW = roi_mask(r, z, *ROI_BELOW_CATH) & SUPPORT
 
-    if not np.any(M_TOP):   print("[WARN] Banda de fuga no intercepta la malla; amplía 'leak_band_mm'.")
-    if not np.any(M_BELOW): print("[WARN] Banda bajo cátodo no intercepta la malla; revisa ROI_BELOW_CATH.")
+    if not np.any(M_TOP):
+        print("[WARN] Leak band does not intersect mesh; increase 'leak_band_mm'.")
+    if not np.any(M_BELOW):
+        print("[WARN] Below-cathode band missing; check ROI_BELOW_CATH configuration.")
+
 
     ring_names = list_rings_from_basis(Bstack); nR = len(ring_names)
     vmin_c, vmax_c = BOUNDS['cath']; vmin_g, vmax_g = BOUNDS['gate']
 
     rows = []
-    prev_theta = None
+    prev_theta = None # memory between E targets (warm start)
 
     for E0_cm in E_targets_Vcm:
-        E0 = float(E0_cm)*100.0  # V/m
+        E0 = float(E0_cm)*100.0  # convert V/cm → V/m
 
-        # ----- bounds y plantilla de theta -----
+        # --- Define parameter bounds and seeds ---
         def theta_bounds():
             b = [(vmin_g, min(vmax_g, GATE_MAX_BY_ANODE))]
             if opt_pmts:
@@ -952,39 +988,46 @@ def optimize_voltages_constrained(
         bnds = theta_bounds()
 
         def make_theta(seed_vg):
+            """Construct initial parameter vector θ."""
             th = [float(seed_vg)]
             if opt_pmts: th += [PMT_TOP_V, PMT_BOT_V]
             if opt_rings: th += [1.0]*(nR+1)
             if opt_offset: th += [0.0]
             return np.array(th, float)
 
-        # semillas de Vg (respeta límite de ánodo)
+        # Seeds for V_gate exploration
         seeds = []
         if prev_theta is not None:
-            seeds.append(float(prev_theta[0]))
+            vg_center = float(prev_theta[0])
+            seeds = list(np.linspace(vg_center - 300, vg_center + 300, 7))
 
-        for vg0 in vg_seeds:
+        for vg0 in vg_seeds: 
             vg0 = np.clip(vg0, vmin_g, min(vmax_g, GATE_MAX_BY_ANODE))
             if (vg0 + EXTRACTION) <= ANODE_MAX:
-                seeds.append(vg0)
+                seeds.append(float(vg0))
  
         best_res, best_theta = None, None
+
+        # --- Iterate over all gate seeds ---
         for vg0 in seeds:
             th0 = make_theta(vg0)
-            # pequeña inercia con la solución previa
             if prev_theta is not None:
                 k = min(len(th0), len(prev_theta))
-                th0[:k] = 0.7*th0[:k] + 0.3*prev_theta[:k]
+                th0[:k] = 0.7*th0[:k] + 0.3*prev_theta[:k] # slight inertia
 
             def cost_theta(theta):
+                """Main cost function for L-BFGS-B."""
                 j = 0
                 Vg = float(theta[j]); j += 1
                 V = {}
+
+                # Optional PMT optimization
                 if opt_pmts:
                     V['pmt_top'] = float(theta[j]); V['pmt_bot'] = float(theta[j+1]); j += 2
                 else:
                     V['pmt_top'] = PMT_TOP_V; V['pmt_bot'] = PMT_BOT_V
 
+                # Ring configuration
                 if opt_rings:
                     deltas = np.clip(theta[j:j+nR+1], 1e-4, None)
                     j += (nR + 1)
@@ -993,10 +1036,9 @@ def optimize_voltages_constrained(
                 elif (rings_power_alpha is not None) and ring_names:
                     deltas = ring_weights_from_power_alpha(ring_names, rings_power_alpha)
                 else:
-                    # rampa lineal
                     deltas = np.ones(nR + 1, float)
 
-                # Vc que fija el drift (con orden físico)
+                # Solve for Vc matching target E0
                 Vc, hit_bound, _ = solve_cathode_for_E0(
                     Bstack, Vg, EXTRACTION, M_LXE, E0,
                     V, ring_names, vmin_c, vmax_c, tol=50.0,
@@ -1005,64 +1047,43 @@ def optimize_voltages_constrained(
                     enforce_sign=True, eps_sign=25.0
                 )
 
-                V.update(rings_from_positions(Vc, Vg, ring_names, deltas))
+                names_bu, w_pos = segment_weights_from_positions(ring_names, RING_Z, z_cath=Z_CATH, z_gate=Z_GATE)
+                w_use = np.asarray(deltas if deltas is not None else w_pos, float)
+                V.update(rings_from_segment_weights(Vc, Vg, names_bu, w_use))
 
                 V['gate']  = Vg
                 V['cath']  = Vc
                 V['anode'] = Vg + EXTRACTION
 
-                # offset común (opcional)
+                # Optional global voltage offset
                 delta = float(theta[j]) if opt_offset else 0.0
                 if opt_offset:
                     V['gate']  += delta; V['cath'] += delta; V['anode'] += delta
                     for name in ring_names: V[name] += delta
 
-                # límites HV
+                # High-voltage boundary penalties
                 pen_lim = 0.0
                 pen_lim += 0.0 if BOUNDS['gate'][0] <= V['gate'] <= BOUNDS['gate'][1] else 1.0
                 pen_lim += 0.0 if BOUNDS['cath'][0] <= V['cath'] <= BOUNDS['cath'][1] else 1.0
                 pen_lim += 0.0 if (V['anode'] <= ANODE_MAX) else 1.0
 
-                # campo y métricas
+                # Compute field and metrics
                 _, _, Er, Ez = superpose_fast(Bstack, V)
-                Ed_med, p90, inhEz = drift_metrics_rel(Er, Ez, M_LXE)
-                theta90 = theta_p90_deg(Er, Ez, M_LXE)
-                ratio90 = np.tan(np.deg2rad(theta90)) 
+                Ed_med, dev_mean, inhEz = drift_metrics_rel(Er, Ez, M_LXE)
+                theta_med = theta_med_deg_balanced(Er, Ez, M_LXE, z) 
 
-                if metric == 'angle':
-                    theta90 = theta_p90_deg(Er, Ez, M_LXE)
-                    main = np.tan(np.deg2rad(theta90))  # ~Er/|Ez|
-                elif metric == 'deflection':
-                    H = (d_gate - d_cathode - 2*MARGIN_Z)  # altura efectiva de deriva (m)
-                    dr90_mm = deflection_p90_mm(Er, Ez, r, z, M_LXE)
-                    main = (dr90_mm/1000.0) / max(H, 1e-6)  # adimensional ~tan(ángulo medio)
-
-                elif metric == 'rms':
-                    Er_sel = Er[M_LXE]; Ez_sel = Ez[M_LXE]
-                    finite = np.isfinite(Er_sel) & np.isfinite(Ez_sel)
-                    Er_abs = np.abs(Er_sel[finite]); Ez_abs = np.abs(Ez_sel[finite])
-                    floor  = max(1.0, np.percentile(Ez_abs, 10))
-                    ratio  = Er_abs / np.clip(Ez_abs, floor, None)
-                    main   = float(np.sqrt(np.nanmean(ratio**2)))
-
-                else:  # 'angle_bal' (por defecto)
-                    theta90 = theta_p90_deg_balanced(Er, Ez, M_LXE, z)
-                    main = np.tan(np.deg2rad(theta90))
-
-                # clava E0 y penaliza límites
-                pen_E0 = 1e3 * ((Ed_med - E0)/max(E0, 100.0))**2
+                # Core term: average field deviation
+                main = dev_mean
+                rel_err = (Ed_med - E0) / max(E0, 300.0)
+                pen_E0 = 200.0 * rel_err**2
                 pen = pen_E0 + 1e3*pen_lim
 
-                # penalizaciones absolutas
-                leak90 = p90_ratio_band(Er, Ez, M_TOP)               # Er/Ez en banda alta LXe
-                hot90  = p90_absE(Er, Ez, M_BELOW)/max(E0, 100.0)    # |E|/E0 bajo cátodo
+                # Additional penalties
                 revfr  = frac_reversed(Ez, M_BELOW, expected_sign=-1)
 
-                soft_anchor = soft_anchor_k * ((V['cath'] - V['pmt_bot'])/400.0)**2
+                return (main + lambda_inh*inhEz + pen + w_rev*revfr)
 
-                return (main + lambda_inh*inhEz + pen) 
-
-
+            # Run optimizer
             res = minimize(cost_theta, th0, method='L-BFGS-B',
                            bounds=bnds, options={'maxiter': 300})
             if (best_res is None) or (res.fun < best_res.fun):
@@ -1070,10 +1091,11 @@ def optimize_voltages_constrained(
 
         prev_theta = best_theta.copy()
 
-        # ----- reconstrucción con la mejor semilla -----
+        # --- Reconstruct final best configuration ---
         j = 0
         Vg_opt = float(best_theta[j]); j += 1
         Vopt = {}
+
         if opt_pmts:
             Vopt['pmt_top'] = float(best_theta[j]); Vopt['pmt_bot'] = float(best_theta[j+1]); j += 2
         else:
@@ -1098,23 +1120,20 @@ def optimize_voltages_constrained(
 
         delta_opt = float(best_theta[j]) if opt_offset else 0.0
 
-        Vopt.update(rings_from_positions(Vc_opt, Vg_opt, ring_names, deltas_final))
+        names_bu, w_pos = segment_weights_from_positions(ring_names, RING_Z, z_cath=Z_CATH, z_gate=Z_GATE)
+        w_use = np.asarray(deltas_final if deltas_final is not None else w_pos, float)
+        Vopt.update(rings_from_segment_weights(Vc_opt, Vg_opt, names_bu, w_use))
+
         Vopt['gate']  = Vg_opt + (delta_opt if opt_offset else 0.0)
         Vopt['cath']  = Vc_opt + (delta_opt if opt_offset else 0.0)
         Vopt['anode'] = Vg_opt + EXTRACTION + (delta_opt if opt_offset else 0.0)
 
-        # métricas finales
+        # Final metrix
         _, _, Er, Ez = superpose_fast(Bstack, Vopt)
-        Ez_abs_roi = np.abs(Ez[M_LXE]); Ed_med = float(np.nanmedian(Ez_abs_roi)) if Ez_abs_roi.size else 0.0
-        theta90 = theta_p90_deg(Er, Ez, M_LXE)
-        theta90_bal = theta_p90_deg_balanced(Er, Ez, M_LXE,z)
-        ratio90 = np.tan(np.deg2rad(theta90))
-        ratio90_bal = np.tan(np.deg2rad(theta90_bal))
-        dr90_mm = deflection_p90_mm(Er, Ez, r, z, M_LXE)
-        _, _, inhEz = drift_metrics_rel(Er, Ez, M_LXE)
+        Ed_med2, dev_mean2, inhEz2 = drift_metrics_rel(Er, Ez, M_LXE)
+        theta_med = theta_med_deg_balanced(Er, Ez, M_LXE, z)
+        drmean_mm = deflection_mean_mm(Er, Ez, r, z, M_LXE)
 
-        # guarda fila
-        ring_cols = {f"V_{name}": float(Vopt.get(name, np.nan)) for name in ring_names}
         rows.append(dict(
             Ecm=E0_cm,
             V_gate=float(Vopt['gate']),
@@ -1122,84 +1141,67 @@ def optimize_voltages_constrained(
             V_anode=float(Vopt['anode']),
             V_pmt_top=float(Vopt['pmt_top']),
             V_pmt_bot=float(Vopt['pmt_bot']),
-            p90=float(ratio90_bal if metric=='angle_bal' else
-                      ratio90 if metric=='angle' else
-                      (dr90_mm/1000.0)/max((d_gate-d_cathode-2*MARGIN_Z),1e-6)),
-            inhEz=float(inhEz),
-            Ed_kVcm=float(Ed_med/1e5),
+            mean=float(dev_mean2),
+            inhEz=float(inhEz2),
+            Ed_kVcm=float(Ed_med2/1e5),
             hit_bound=int(hit_bound),
-            theta_p90_deg=float(theta90),
-            theta_p90_bal_deg=float(theta90_bal),
-            deflect_p90_mm=float(dr90_mm),
-            **ring_cols
+            theta_med_bal_deg=float(theta_med),
+            deflect_mean_mm=float(drmean_mm),
+            **{f"V_{name}": float(Vopt.get(name, np.nan)) for name in ring_names}
         ))
 
     return pd.DataFrame(rows)
 
 
-# ============== Optional: discrete PMT grid search (-900..-1100, step 50) ==============
-PMT_GRID = np.arange(-900.0, -1100.0 - 1e-6, -50.0)  # -900, ..., -1100
-
-def optimize_with_pmt_grid(Bstack, E_targets_Vcm, roi_lxe,
-                           lambda_inh=0.6, lambda_smooth=0.02,
-                           use_rings=True):
-    """
-    For each target field, try all (top,bottom) PMT combinations on a discrete grid,
-    optimize gate (and rings if requested), solve V_cath by bisection, and pick the
-    combo with minimal score = p90 + 0.5*inhEz. Returns a DataFrame of best rows.
-    """
-    best_rows = []
-    for E0_cm in E_targets_Vcm:
-        best = None
-        for p_top in PMT_GRID:
-            for p_bot in PMT_GRID:
-                old_top, old_bot = PMT_TOP_V, PMT_BOT_V
-                try:
-                    globals()['PMT_TOP_V'], globals()['PMT_BOT_V'] = p_top, p_bot
-                    df1 = optimize_voltages_constrained(
-                        Bstack, [E0_cm], roi_lxe=roi_lxe,
-                        opt_pmts=False,
-                        opt_rings=use_rings,
-                        lambda_inh=lambda_inh,
-                        lambda_smooth=lambda_smooth
-                    )
-                    row = dict(df1.iloc[0])
-                    row['V_pmt_top'] = p_top
-                    row['V_pmt_bot'] = p_bot
-                    score = row['p90'] + 0.5*row['inhEz']
-                    if (best is None) or (score < best[0]):
-                        best = (score, row)
-                finally:
-                    globals()['PMT_TOP_V'], globals()['PMT_BOT_V'] = old_top, old_bot
-        best_rows.append(best[1])
-    return pd.DataFrame(best_rows)
-
 def add_Egas_and_save(df, tag):
+    """
+    Compute gas amplification fields, append to DataFrame, and save results.
+
+    For each optimized configuration:
+      - Compute median extraction field in the gas region (kV/cm)
+      - Save to CSV
+      - Generate summary plots of voltages, deviation, deflection, etc.
+    """
+
     Eg_list = []
     for _, row in df.iterrows():
+        # Build voltage dictionary for current configuration
         V = dict(gate=row['V_gate'], cath=row['V_cath'], anode=row['V_anode'],
                  pmt_top=row['V_pmt_top'], pmt_bot=row['V_pmt_bot'])
         Eg_list.append(median_gas_field_from_V(Bstack, V, roi_gas=ROI_GXe))  # kV/cm
+
     df['Egas_kVcm'] = Eg_list
     df.to_csv(f"optimal_voltages_3D_{tag}.csv", index=False)
-    plot_optimal(df, out=f"optimal_voltages_vs_E_3D_{tag}_8.png")
-    plot_deviation(df, out=f"deviation_vs_E_3D_{tag}_th_8.png")
-    plot_deflection(df, out=f"deflection_vs_E_3D_{tag}_8.png")
-    plot_deltaEz(df, out=f"deltaEz_vs_E_3D_{tag}_8.png")
-    plot_theta(df,   out=f"theta_vs_E_3D_{tag}_8.png")
+
+    # Generate standard diagnostic plots
+    plot_optimal(df, out=f"optimal_voltages_vs_E_3D_{tag}.png")
+    plot_deviation(df, out=f"deviation_vs_E_3D_{tag}_th.png")
+    plot_deflection(df, out=f"deflection_vs_E_3D_{tag}.png")
+    plot_deltaEz(df, out=f"deltaEz_vs_E_3D_{tag}.png")
+    plot_theta(df,   out=f"theta_vs_E_3D_{tag}.png")
 
 
-def plot_p90_multi(dfs, labels, out="deviation_vs_E_3D_compare_gate_2_8.png"):
+def plot_mean_multi(dfs, labels, out="deviation_vs_E_3D_compare_gate_2.png"):
+    """
+    Compare mean field deviations across multiple optimization series.
+    """
+
     plt.figure(figsize=(6.2, 3.8))
     for df, lab in zip(dfs, labels):
-        plt.semilogy(df['Ecm'], 100.0*df['p90'], label=lab)
-    # si hay columna hit_bound, marca los puntos que saturan el límite de Vcath
-    for df, lab in zip(dfs, labels):
-        if 'hit_bound' in df.columns:
+        ycol = 'mean' if 'mean' in df.columns else None
+        if ycol is None:
+            print(f"[WARN] DF sin 'mean'/'mean' para {lab}; lo salto.")
+            continue
+        plt.semilogy(df['Ecm'], 100.0*df[ycol], label=lab)
+
+    # Mark boundary hits (hit_bound == 1) if present
+    for df, _ in zip(dfs, labels):
+        if ('hit_bound' in df.columns) and (('mean' in df.columns) or ('mean' in df.columns)):
             m = df['hit_bound'] > 0
+            ycol = 'mean' if 'mean' in df.columns else 'mean'
             if m.any():
-                plt.scatter(df.loc[m, 'Ecm'], 100.0*df.loc[m, 'p90'],
-                            s=16, marker='x')
+                plt.scatter(df.loc[m, 'Ecm'], 100.0*df.loc[m, ycol], s=16, marker='x')
+
     plt.xlabel('Median drift field [V/cm]')
     plt.ylabel('Deviation [%]')
     plt.grid(True, which='both', ls=':')
@@ -1209,40 +1211,94 @@ def plot_p90_multi(dfs, labels, out="deviation_vs_E_3D_compare_gate_2_8.png"):
     plt.close()
 
 
-# ===================== Sweep V_gate at fixed E_drift =====================
+
+# ============================================================
+# 11. PARAMETRIC SWEEPS AND FIELD DIAGNOSTICS
+# ============================================================
+
+def leak_mean_band(Er, Ez, mask):
+    """
+    Compute mean(|Er|/|Ez|) within a leakage band (below the gate).
+
+    - Applies a numerical floor to Ez.
+    - Used to quantify horizontal field leakage near the liquid–gas interface.
+    """
+    idx = np.where(mask)
+    if idx[0].size == 0: return 0.0
+    Erb = np.abs(Er[idx]); Ezb = np.abs(Ez[idx])
+    floor = max(1.0, np.percentile(Ezb, 10))
+    r = Erb / np.clip(Ezb, floor, None)
+    r = r[np.isfinite(r)]
+    return float(np.nanmean(r)) if r.size else 0.0
+
+
+def theta_med_deg_balanced(Er, Ez, mask, z):
+    """
+    Compute median drift angle θ (deg) using z-median per column.
+    This version is robust against outliers and low-field instabilities.
+    """
+    idx = np.where(mask)
+    if idx[0].size == 0: return 0.0
+    Er_sel = np.where(mask, Er, np.nan)
+    Ez_sel = np.where(mask, Ez, np.nan)
+    Ez_abs = np.abs(Ez_sel)
+    floor  = np.nanmax([1.0, np.nanpercentile(Ez_abs, 10)])
+    ratio  = np.abs(Er_sel) / np.clip(Ez_abs, floor, None)
+    theta  = np.arctan(ratio)                      # rad
+    theta_med_z = np.nanmedian(theta, axis=0)      # (Nr,)
+    th_med = float(np.nanmedian(np.abs(theta_med_z)))
+    return np.degrees(th_med)
+
+
 def sweep_gate_for_E0(Bstack, E0_cm=60.0, roi_lxe=ROI_LXe,
                       gate_min=None, gate_max=None, n_steps=121,
                       leak_band_mm=(2.0, 0.2), out_csv="gate_sweep_E60.csv",
-                      out_png="gate_sweep_E60_8.png", top_factor=None, power_alpha=None):
+                      out_png="gate_sweep_E60.png", top_factor=None, power_alpha=None):
     """
-    Barre V_gate a E_drift fijo (E0_cm en V/cm). Anillos en rampa lineal.
-    Guarda CSV y figura con p90(Er/Ez), inhomog(Ez) y la zona donde el solver toca límites.
+    Sweep the gate voltage (V_gate) at a fixed target drift field (E0_cm).
+
+    For each gate voltage:
+      - The cathode voltage (V_cath) is solved via bisection to satisfy
+        median(Ez) ≈ -E0.
+      - The anode voltage is set by V_anode = V_gate + EXTRACTION.
+      - The field map is reconstructed, and key metrics are computed:
+        * mean(|Er|/|Ez|) → lateral leakage
+        * inhEz → field inhomogeneity (RMS)
+        * leak_mean → near-gate leakage
+        * theta_med_deg → median drift angle
+
+    The function stores the results in a CSV file and generates a diagnostic
+    plot showing how field uniformity evolves with gate bias.
     """
+
     import numpy as np, pandas as pd, matplotlib.pyplot as plt
 
     r, z = Bstack['r'], Bstack['z']
     M_LXE = roi_mask(r, z, *roi_lxe)
 
-    # Banda "fuga" más ancha bajo el gate (en mm)
+    # Define wide band below the gate for leakage evaluation
     dz_hi, dz_lo = leak_band_mm[0]*1e-3, leak_band_mm[1]*1e-3
+    M_LXE  = roi_mask(Bstack['r'], Bstack['z'], *ROI_LXe)  & SUPPORT
     ROI_TOP_WIDE = (ROI_R[0], ROI_R[1], d_gate - dz_hi, d_gate - dz_lo)
-    M_TOP = roi_mask(r, z, *ROI_TOP_WIDE)
+    M_TOP = roi_mask(r, z, *ROI_TOP_WIDE) & SUPPORT
+    M_BELOW= roi_mask(r, z, *ROI_BELOW_CATH) & SUPPORT
 
     ring_names = list_rings_from_basis(Bstack); nR = len(ring_names)
 
-    # Rango de gate
+    # Voltage range for the scan
     if gate_min is None: gate_min = BOUNDS['gate'][0]
     if gate_max is None: gate_max = min(BOUNDS['gate'][1], GATE_MAX_BY_ANODE)
     gate_grid = np.linspace(gate_min, gate_max, n_steps)
 
     rows = []
-    E0 = float(E0_cm) * 100.0  # V/m
+    E0 = float(E0_cm) * 100.0  # Convert V/cm → V/m
 
     for Vg in gate_grid:
         Va = Vg + EXTRACTION
         if Va > ANODE_MAX:
-            continue  # respeta el límite del anodo
+            continue  # respect anode limit
 
+        # Ring weighting scheme
         deltas = None
         if (top_factor is not None) and (nR > 0):
             deltas = ring_weights_uniform_plus_top(ring_names, top_factor=top_factor)
@@ -1253,6 +1309,7 @@ def sweep_gate_for_E0(Bstack, E0_cm=60.0, roi_lxe=ROI_LXe,
 
         baseV = dict(pmt_top=PMT_TOP_V, pmt_bot=PMT_BOT_V)
 
+        # Solve cathode voltage for target drift field
         Vc, hit, Ed_signed = solve_cathode_for_E0(
             Bstack, Vg, EXTRACTION, M_LXE, E0,
             baseV, ring_names, BOUNDS['cath'][0], BOUNDS['cath'][1],
@@ -1261,62 +1318,61 @@ def sweep_gate_for_E0(Bstack, E0_cm=60.0, roi_lxe=ROI_LXe,
             enforce_sign=True,  eps_sign=25.0
         )
 
-        # Construye tensiones (anillos en rampa lineal)
+        # Build complete voltage map
         V = {'gate': Vg, 'cath': Vc, 'anode': Va,
              'pmt_top': PMT_TOP_V, 'pmt_bot': PMT_BOT_V}
+        names_bu, w_pos = segment_weights_from_positions(ring_names, RING_Z, z_cath=Z_CATH, z_gate=Z_GATE)
+        w_use = np.asarray(deltas if deltas is not None else w_pos, float)
+        V.update(rings_from_segment_weights(Vc, Vg, names_bu, w_use))
 
-        V.update(rings_from_positions(Vc, Vg, ring_names, deltas))
-
-
-        # Campo y métricas
+        # Compute field and derived metrics
         _, _, Er, Ez = superpose_fast(Bstack, V)
-        Ed_med, p90, inhEz = drift_metrics_rel(Er, Ez, M_LXE)
-        leak90 = p90_ratio_band(Er, Ez, M_TOP)
-        theta90 = theta_p90_deg(Er, Ez, M_LXE)
-        p90 = np.tan(np.deg2rad(theta90))
-
+        Ed_med, dev_mean, inhEz = drift_metrics_rel(Er, Ez, M_LXE)
+        leak_mean = leak_mean_band(Er, Ez, M_TOP)
+        theta_med = theta_med_deg_balanced(Er, Ez, M_LXE, z)
 
         rows.append(dict(
             V_gate=Vg, V_cath=Vc, V_anode=Va,
-            p90=p90, inhEz=inhEz, score=p90 + 0.6*inhEz + 1.2*leak90,
-            leak90=leak90, Ed_kVcm=Ed_med/1e5, hit_bound=int(hit),
-            theta_p90_deg=float(theta90)
+            mean=dev_mean, inhEz=inhEz,
+            score=dev_mean + 0.6*inhEz + 1.2*leak_mean,
+            leak_mean=leak_mean, Ed_kVcm=Ed_med/1e5, hit_bound=int(hit),
+            theta_med_deg=float(theta_med)
         ))
+
 
     df = pd.DataFrame(rows).sort_values("V_gate").reset_index(drop=True)
     df.to_csv(out_csv, index=False)
-    print(f"[OK] guardado {out_csv} con {len(df)} puntos.")
+    print(f"[OK] Saved {out_csv} with {len(df)} points.")
 
-    # ----------- Figura -----------
+    # ----------- Plotting -----------
     fig, ax = plt.subplots(figsize=(6.2,3.8))
-    ax.semilogy(df['V_gate'], 100.0*df['p90'], label='p90: $E_r/E_z$ (LXe)')
-    ax.semilogy(df['V_gate'], 100.0*df['inhEz'], label='inhomog $E_z$ (P90)')
+    ax.semilogy(df['V_gate'], 100.0*df['mean'], label='mean: $E_r/E_z$ (LXe)')
+    ax.semilogy(df['V_gate'], 100.0*df['inhEz'], label='inhomog $E_z$ (RMS)')
     ax.set_xlabel(r'$V_{\rm gate}$ [V]')
     ax.set_ylabel('Deviation [%]')
     ax.grid(True, which='both', ls=':')
     ax.legend(loc='best')
 
-    # marca puntos donde el solver pega en límites o cambia el orden
+    # Mark points where the solver hits limits
     m = df['hit_bound'] > 0
     if m.any():
-        ax.scatter(df.loc[m,'V_gate'], 100.0*df.loc[m,'p90'], s=18, c='k', marker='x', label='hit_bound')
+        ax.scatter(df.loc[m,'V_gate'], 100.0*df.loc[m,'mean'], s=18, c='k', marker='x', label='hit_bound')
 
-    # eje secundario: V_cath para ver el orden Vc<Vg
+    # Secondary axis: cathode voltage
     ax2 = ax.twinx()
     ax2.plot(df['V_gate'], df['V_cath']/1e3, ls='--')
     ax2.set_ylabel(r'$V_{\rm cath}$ [kV]')
     fig.tight_layout()
     fig.savefig(out_png, dpi=200)
     plt.close(fig)
-    print(f"[OK] guardado {out_png}")
+    print(f"[OK] Saved {out_png}")
 
     return df
 
 
-def theta_p90_deg(Er, Ez, mask):
+def theta_mean_deg(Er, Ez, mask):
     """
-    p90 del ángulo de deriva respecto al eje z: theta = arctan(|Er|/|Ez|) en grados.
-    Usa un 'floor' para Ez (como en las otras métricas) para evitar mala condición a campo muy bajo.
+    Compute mean drift angle θ = arctan(|Er|/|Ez|) in degrees.
     """
     idx = np.where(mask)
     if idx[0].size == 0:
@@ -1335,41 +1391,18 @@ def theta_p90_deg(Er, Ez, mask):
     th90   = float(np.quantile(np.abs(theta), 0.90))
     return np.degrees(th90)
 
-def theta_p90_deg_balanced(Er, Ez, mask, z):
+def deflection_mean_mm(Er, Ez, r, z, mask):
     """
-    Agrega por trayectoria: para cada r (columna) toma la mediana en z de theta,
-    y luego el p90 entre columnas. Mucho más estable a bajo campo.
-    """
-    idx = np.where(mask)
-    if idx[0].size == 0:
-        return 0.0
-    Er_sel = np.where(mask, Er, np.nan)
-    Ez_sel = np.where(mask, Ez, np.nan)
+    Compute the mean drift deflection in mm within the ROI.
 
-    # floor de Ez para evitar mala condición
-    Ez_abs = np.abs(Ez_sel)
-    floor  = np.nanmax([1.0, np.nanpercentile(Ez_abs, 10)])
-    ratio  = np.abs(Er_sel) / np.clip(Ez_abs, floor, None)
-    theta  = np.arctan(ratio)  # rad
-
-    # mediana en z por columna (ignora NaNs)
-    theta_med_z = np.nanmedian(theta, axis=0)  # (Nr,)
-
-    # p90 entre columnas radiales
-    th90 = float(np.nanquantile(np.abs(theta_med_z), 0.90))
-    return np.degrees(th90)
-
-def deflection_p90_mm(Er, Ez, r, z, mask):
-    """
-    Integra |Er/Ez| a lo largo de z (trapecios) para cada r dentro de la ROI.
-    Devuelve p90 de |Δr| en milímetros.
+    Integrates |Er/Ez| along z (using trapezoidal rule) for each r column.
+    Returns the 90th percentile of |Δr| in millimeters.
     """
     Nz, Nr = Ez.shape
     Ez_abs = np.abs(Ez)
     floor  = max(1.0, np.nanpercentile(Ez_abs[mask], 10)) if np.any(mask) else 1.0
     ratio  = np.abs(Er) / np.clip(Ez_abs, floor, None)  # ~tan(theta)
 
-    # Δz por fila (z puede no ser uniforme)
     z = np.asarray(z, float)
     dz_rows = np.empty(Nz)
     dz_rows[1:-1] = 0.5*(z[2:]-z[:-2])
@@ -1383,20 +1416,23 @@ def deflection_p90_mm(Er, Ez, r, z, mask):
             continue
         rj = ratio[mj, j]
         dzj = dz_rows[mj]
-        # integración por trapecios en puntos contiguos
+        
         rj_mid = 0.5*(rj[:-1] + rj[1:])
         dz_mid = 0.5*(dzj[:-1] + dzj[1:])
-        dr = np.nansum(rj_mid * dz_mid)  # en metros
-        dr_list.append(abs(dr)*1000.0)   # mm
+        dr = np.nansum(rj_mid * dz_mid)  
+        dr_list.append(abs(dr)*1000.0)   # convert to mm
 
     if not dr_list:
         return 0.0
     return float(np.nanquantile(dr_list, 0.90))
 
+# ============================================================
+# Plot utilities
+# ============================================================
 
-def plot_deltaEz(df, out='deltaEz_vs_E_8.png'):
+def plot_deltaEz(df, out='deltaEz_vs_E.png'):
     """
-    Grafica p90(delta E_z) = inhEz (en %) vs campo objetivo.
+    Plot axial field inhomogeneity (inhEz) vs median drift field.
     """
     plt.figure(figsize=(5.8, 3.6))
     y = 100.0 * df['inhEz']
@@ -1409,25 +1445,26 @@ def plot_deltaEz(df, out='deltaEz_vs_E_8.png'):
     plt.close()
 
 
-def plot_theta(df, out='theta_vs_E_8.png'):
+def plot_theta(df, out='theta_vs_E.png'):
     """
-    Grafica p90 del ángulo de deriva (en grados) vs campo objetivo.
-    Usa la versión 'balanced' (más robusta a bajo campo).
+    Plot drift angle θ vs drift field using balanced definition.
     """
-    if 'theta_p90_bal_deg' not in df.columns:
-        print("[WARN] 'theta_p90_bal_deg' not found in df; skipping plot.")
-        return
+    if 'theta_med_bal_deg' not in df.columns: return
+
     plt.figure(figsize=(5.8, 3.6))
-    plt.plot(df['Ecm'], df['theta_p90_bal_deg'], label=r'$p90(\theta)$ (deg)')
+    plt.plot(df['Ecm'], df['theta_med_bal_deg'], label=r'$\mathrm{median}(\theta)$ (deg)')
     plt.xlabel('Median drift field [V/cm]')
-    plt.ylabel('Drift angle p90 [deg]')
+    plt.ylabel('Drift angle [deg]')
     plt.grid(True, ls=':')
     plt.legend()
     plt.tight_layout()
     plt.savefig(out, dpi=180)
     plt.close()
 
-def plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_multi_8.png"):
+def plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_multi.png"):
+    """
+    Compare axial inhomogeneity across multiple configurations.
+    """
     plt.figure(figsize=(6.2, 3.8))
     for df, lab in zip(dfs, labels):
         if 'inhEz' in df.columns:
@@ -1441,34 +1478,40 @@ def plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_multi_8.png"):
     plt.close()
 
 
-def plot_theta_multi(dfs, labels, out="theta_vs_E_multi_8.png"):
+def plot_theta_multi(dfs, labels, out="theta_vs_E_multi.png"):
+    """
+    Compare drift angle vs field across multiple configurations.
+    """
     plt.figure(figsize=(6.2, 3.8))
     for df, lab in zip(dfs, labels):
-        if 'theta_p90_deg' in df.columns:
-            plt.plot(df['Ecm'], df['theta_p90_deg'], label=lab)
+        if 'theta_med_bal_deg' in df.columns:
+            plt.plot(df['Ecm'], df['theta_med_bal_deg'], label=lab)
     plt.xlabel('Median drift field [V/cm]')
-    plt.ylabel('Drift angle p90 [deg]')
+    plt.ylabel('Drift angle [deg]')
     plt.grid(True, ls=':')
     plt.legend()
     plt.tight_layout()
     plt.savefig(out, dpi=200)
     plt.close()
 
+# ============================================================
+# Experiments: ring geometry tuning
+# ============================================================
 
 def experiment_top_ring(Bstack, E0_cm=60.0,
                         factors=(1.00, 1.05, 1.10, 1.12)):
     """
-    Para cada 'top_factor' barre V_gate, resuelve V_cath, y guarda CSV/PNG.
-    Devuelve una tabla con el mejor punto (mínimo score) de cada factor.
+    Perform gate-voltage sweeps for several 'top_factor' values.
+    Each factor modifies the last ring segment (near the gate).
     """
     import pandas as pd
     ring_names = list_rings_from_basis(Bstack)
     tagE = f"E{int(round(E0_cm))}"
-
     best_rows = []
+
     for f in factors:
         csv = f"gate_sweep_{tagE}_topF_{str(f).replace('.','p')}.csv"
-        png = f"gate_sweep_{tagE}_topF_{str(f).replace('.','p')}_8.png"
+        png = f"gate_sweep_{tagE}_topF_{str(f).replace('.','p')}.png"
         df = sweep_gate_for_E0(Bstack, E0_cm=E0_cm,
                                gate_min=max(-800.0, BOUNDS['gate'][0]),
                                gate_max=min(+1200.0, GATE_MAX_BY_ANODE),
@@ -1483,21 +1526,21 @@ def experiment_top_ring(Bstack, E0_cm=60.0,
 
     out = pd.DataFrame(best_rows)
     out.to_csv(f"best_top_ring_{tagE}.csv", index=False)
-    print(f"[OK] guardado best_top_ring_{tagE}.csv")
+    print(f"[OK] Saved best_top_ring_{tagE}.csv")
     return out
 
 def experiment_power_alpha(Bstack, E0_cm=60.0,
                            alphas=(0.7, 0.9, 1.0, 1.2, 1.5, 2.0)):
     """
-    Para cada 'alpha' barre V_gate, resuelve V_cath y guarda CSV/PNG.
-    Igual que experiment_top_ring, pero usando rampa t**alpha.
+    Same as `experiment_top_ring`, but tests power-law ring spacing (t**alpha).
     """
     import pandas as pd
     tagE = f"E{int(round(E0_cm))}"
     best_rows = []
+
     for a in alphas:
         csv = f"gate_sweep_{tagE}_alpha_{str(a).replace('.','p')}.csv"
-        png = f"gate_sweep_{tagE}_alpha_{str(a).replace('.','p')}_8.png"
+        png = f"gate_sweep_{tagE}_alpha_{str(a).replace('.','p')}.png"
         df = sweep_gate_for_E0(
             Bstack, E0_cm=E0_cm,
             gate_min=max(-800.0, BOUNDS['gate'][0]),
@@ -1514,10 +1557,14 @@ def experiment_power_alpha(Bstack, E0_cm=60.0,
 
     out = pd.DataFrame(best_rows)
     out.to_csv(f"best_power_alpha_{tagE}.csv", index=False)
-    print(f"[OK] guardado best_power_alpha_{tagE}.csv")
+    print(f"[OK] Saved best_power_alpha_{tagE}.csv")
     return out
 
+
 def optimize_multi_alpha(Bstack, E_targets_Vcm, roi_lxe, alphas):
+    """
+    Run voltage optimization for multiple ring-spacing exponents (alpha).
+    """
     dfs, labels = [], []
     for a in alphas:
         tag = f"alpha_{str(a).replace('.','p')}_7rings_roi"
@@ -1528,172 +1575,199 @@ def optimize_multi_alpha(Bstack, E_targets_Vcm, roi_lxe, alphas):
         )
         add_Egas_and_save(df, tag)
         dfs.append(df); labels.append(f"α={a}")
-    plot_p90_multi(dfs, labels, out="deviation_vs_E_3D_MULTI_poweralpha_8.png")
-    plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_3D_MULTI_poweralpha_8.png")
-    plot_theta_multi(dfs, labels, out="theta_vs_E_3D_MULTI_poweralpha_8.png")
+
+    # Comparison plots across alpha values
+    plot_mean_multi(dfs, labels, out="deviation_vs_E_3D_MULTI_poweralpha.png")
+    plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_3D_MULTI_poweralpha.png")
+    plot_theta_multi(dfs, labels, out="theta_vs_E_3D_MULTI_poweralpha.png")
     return dfs
 
 
+def plot_deltaE_map(Bstack, Vdict, roi=None, out="deltaE_map.png", signed=False):
+    """
+    Visualize axial field inhomogeneity ΔE_z / E_z,median on the (r²,z) plane.
+    """
+    r, z, Er, Ez = superpose_fast(Bstack, Vdict)
+    M = SUPPORT.copy()
+    if roi is not None:
+        M &= roi_mask(r, z, *roi)
+
+    Ez_abs = np.abs(Ez)
+    Ed_med = float(np.nanmedian(Ez_abs[M]))
+    eps = max(1e-12, 1e-3*Ed_med)  # numerical cushion
+
+    if signed:
+        # Signed deviation (positive = above median)
+        delta = (np.where(M, Ez_abs, np.nan) - Ed_med) / (Ed_med + eps)
+        vmin, vmax = -0.1, 0.1
+        cbar_label = r'$(|E_z|-\mathrm{med}(|E_z|))/\mathrm{med}(|E_z|)$'
+    else:
+        # Absolute deviation (magnitude of inhomogeneity)
+        delta = np.abs(np.where(M, Ez_abs, np.nan) - Ed_med) / (Ed_med + eps)
+        vmin, vmax = 0.0, 0.1
+        cbar_label = r'$|\,|E_z|-\mathrm{med}(|E_z|)\,|/\mathrm{med}(|E_z|)$'
+
+    # Restrict to ROI for display
+    rows = np.where(np.any(M, axis=1))[0]; cols = np.where(np.any(M, axis=0))[0]
+    z_show, r_show = z[rows], r[cols]; Dshow = delta[np.ix_(rows, cols)]
+
+    R2 = (np.meshgrid(r_show, z_show)[0]**2)*1e4
+    extent = [np.nanmin(R2), np.nanmax(R2), np.nanmin(z_show)*100, np.nanmax(z_show)*100]
+
+    plt.figure(figsize=(6,3.8))
+    im = plt.imshow(Dshow, origin='lower', extent=extent, aspect='auto', vmin=vmin, vmax=vmax)
+    im.cmap.set_bad(im.cmap(0.0), 1.0)
+    cbar = plt.colorbar(im); cbar.set_label(cbar_label)
+    plt.xlabel(r'$r^2$ (cm$^2$)'); plt.ylabel('z (cm)')
+    plt.tight_layout(); plt.savefig(out, dpi=160); plt.close()
 
 
-# ===================== Main Script =====================
+def _dbg_roi_count(mask, name="ROI"):
+    """
+    Debug utility: print number of points within a ROI mask.
+
+    Example
+    -------
+    >>> _dbg_roi_count(M_LXE, name="LXe Region")
+    [DBG] LXe Region: 15023/24000 points
+    """
+    n = int(np.count_nonzero(mask))
+    N = int(mask.size)
+    print(f"[DBG] {name}: {n}/{N} points")
+
+
+# ============================================================
+#  MAIN EXECUTION SCRIPT
+#  Field optimization and diagnostics for LXe TPC geometry
+# ============================================================
+
 if __name__ == "__main__":
-    # 1) Load 1V electrode basis from superposition_3D.csv using cache
+    # --------------------------------------------------------
+    # 0) Load precomputed electrode basis and cached metadata
+    # --------------------------------------------------------
     Bstack = load_basis_cache(PATH_BASIS, Nr=NR_BINS, rmax=RMAX_FOR_BIN)
     r, z = Bstack['r'], Bstack['z']
+    SUPPORT = basis_support_mask(Bstack)
     print(">>> Loaded electrode basis:", Bstack['names'])
 
-    #df_sweep_60 = sweep_gate_for_E0(Bstack, E0_cm=60.0,
-    #                            gate_min=max(-800.0, BOUNDS['gate'][0]),
-    #                            gate_max=min(+1200.0, GATE_MAX_BY_ANODE),
-    #                            n_steps=121,
-    #                            out_csv="gate_sweep_E60.csv",
-    #                            out_png="gate_sweep_E60_8.png")
+    # --- Quick check of basis metadata cache ---
+    try:
+        npz = np.load(CACHE_NPZ, allow_pickle=True, mmap_mode='r')
+        meta = npz['meta'].item()
+        print("Cache metadata:", {k: meta[k] for k in ['version','path','Nr','rmax','size']})
+    except Exception as e:
+        print("[WARN] Cache metadata not found or invalid:", e)
 
-
-    # 2) Optional validation: compare against direct simulation from example_3D.csv
+    # --------------------------------------------------------
+    # 1) Optional validation against direct COMSOL or CSV data
+    # --------------------------------------------------------
     if DO_VALIDATION and os.path.exists(PATH_EXAMPLES):
         try:
             direct = load_direct_on_basis_grid_interp(PATH_EXAMPLES, Bstack, rmax=RMAX_FOR_BIN)
-            # Reference voltages: gate=0, cathode=-4000, anode=+4000, fixed PMTs, ramped rings
-            Vref = Vdict_for_E(gate_voltage=0.0,
-                   pmt_top=PMT_TOP_V, pmt_bottom=PMT_BOT_V,
-                   include_rings=True, basis_like=Bstack, ring_positions=RING_Z)
-
-            plot_diff_map(Bstack, Vref, direct, full_extent=True, out='/Users/elenamunozrivas/Desktop/superpos_3D_2_8.png')
-            print(">>> Validation plot saved: superpos_8.png")
+            Vref = Vdict_for_E(gate_voltage=0.0, pmt_top=PMT_TOP_V, pmt_bottom=PMT_BOT_V,
+                               include_rings=True, basis_like=Bstack, ring_positions=RING_Z)
+            plot_diff_map(Bstack, Vref, direct, full_extent=True, out='superpos_3D_check.png')
+            print(">>> Validation plot saved: superpos_3D_check.png")
         except Exception as e:
             print(f"[WARNING] Validation skipped: {e}")
 
-    # 3) Voltage optimization in your drift field range (0–1300 V/cm)
-    targets = np.linspace(0.0, 1300.0, 131)  # V/cm
+    # --------------------------------------------------------
+    # 2) Define target drift-field range
+    # --------------------------------------------------------
+    targets = np.linspace(20.0, 600.0, 131)  # V/cm
+    # For quick debugging, you can replace with e.g. np.arange(0, 1301, 100)
 
+    # --------------------------------------------------------
+    # 2b) ROI verification (apply support mask)
+    # --------------------------------------------------------
+    M_LXE = roi_mask(r, z, *ROI_LXe) & SUPPORT
+    _dbg_roi_count(M_LXE, "ROI_LXe")
 
-    # --- variantes con ring_1 independiente ---
+    print("Initialization complete")
 
-    best_alpha = experiment_power_alpha(Bstack, E0_cm=60.0,
-                                        alphas=(0.7, 0.9, 1.0, 1.2, 1.5, 2.0))
+    # ========================================================
+    #  SCENARIO A — Fixed PMTs and fixed rings (linear ramp)
+    # ========================================================
+    df_base = optimize_voltages_constrained(
+        Bstack, targets, roi_lxe=ROI_LXe,
+        opt_pmts=False, opt_rings=False,
+        lambda_inh=0.6, lambda_smooth=0.02,
+        opt_offset=False
+    )
+    add_Egas_and_save(df_base, "base_fixed")
 
-    # (B) Curvas vs E comparando α:
-    dfs_pow = optimize_multi_alpha(Bstack, targets, ROI_LXe,
-                                   alphas=(0.7, 1.0, 1.2, 1.5, 2.0))
+    # --- Field inhomogeneity map at 60 V/cm ---
+    row60 = df_base.iloc[(df_base['Ecm'] - 60).abs().argmin()]
+    V60   = dict(gate=row60['V_gate'], cath=row60['V_cath'], anode=row60['V_anode'],
+                 pmt_top=row60['V_pmt_top'], pmt_bot=row60['V_pmt_bot'])
+    plot_deltaE_map(Bstack, V60, roi=ROI_LXe, out="deltaE_map_E60_base.png")
 
+    # ========================================================
+    #  SCENARIO B — Free PMT voltages, fixed rings
+    # ========================================================
+    df_pmts = optimize_voltages_constrained(
+        Bstack, targets, roi_lxe=ROI_LXe,
+        opt_pmts=True, opt_rings=False,
+        lambda_inh=0.6, lambda_smooth=0.02,
+        opt_offset=False
+    )
+    add_Egas_and_save(df_pmts, "pmts_free")
 
-    factors = [0.7, 1.00, 1.2, 1.5, 2.0]  # 1.00=control (uniforme), >1.0 acerca ring_1 al gate
-    
-    dfs_last = []
-    labels_last = []
-    
-    for f in factors:
-        tag = f"lastring_f{str(f).replace('.','p')}_7rings_roi"
-        df_last = optimize_voltages_constrained(
+    # ========================================================
+    #  SCENARIO C — Modify only the last ring (top segment)
+    # ========================================================
+    last_ring_factors = [0.5, 0.7, 1.0, 1.2, 1.5, 2.0]  # 1.0=control
+    dfs_last, labels_last = [], []
+    for f in last_ring_factors:
+        tag = f"lastRing_x{str(f).replace('.','p')}"
+        df = optimize_voltages_constrained(
             Bstack, targets, roi_lxe=ROI_LXe,
             opt_pmts=False, opt_rings=False,
+            rings_top_factor=f,    # <-- affects only the last inter-ring step
             lambda_inh=0.6, lambda_smooth=0.02,
-            opt_offset=False, delta_bounds=(-1000.0, 1000.0),
-            rings_top_factor=f            # <--- clave
+            opt_offset=False
         )
-        add_Egas_and_save(df_last, tag)
-        dfs_last.append(df_last)
-        labels_last.append(f"last ring ×{f}")
+        add_Egas_and_save(df, tag)
+        dfs_last.append(df); labels_last.append(f"last ring ×{f}")
 
-    # Plots múltiples “como los tuyos”, pero comparando los factores:
-    plot_p90_multi(dfs_last,    labels_last, out="deviation_vs_E_3D_MULTI_lastring_factors_8.png")
-    plot_deltaEz_multi(dfs_last, labels_last, out="deltaEz_vs_E_3D_MULTI_lastring_factors_8.png")
-    plot_theta_multi(dfs_last,   labels_last, out="theta_vs_E_3D_MULTI_lastring_factors_8.png")
+    # ========================================================
+    #  SCENARIO D — Power-law ring weighting (t**alpha)
+    # ========================================================
+    alphas = [0.5, 0.7, 1.0, 1.2, 1.5, 2.0]
+    dfs_alpha, labels_alpha = [], []
 
+    for a in alphas:
+        tag = f"allRings_alpha{str(a).replace('.','p')}"
+        df = optimize_voltages_constrained(
+            Bstack, targets, roi_lxe=ROI_LXe,
+            opt_pmts=False, opt_rings=False,
+            rings_power_alpha=a,   # <-- modifies all ring weights
+            lambda_inh=0.6, lambda_smooth=0.02,
+            opt_offset=False
+        )
+        add_Egas_and_save(df, tag)
+        dfs_alpha.append(df); labels_alpha.append(f"all rings α={a}")
 
+    # ========================================================
+    #  COMPARATIVE PLOTS
+    # ========================================================
 
+    # Base vs free-PMT comparison
+    plot_mean_multi([df_base, df_pmts], ["base (PMTs OFF)", "PMTs ON"],
+                   out="deviation_vs_E_base_vs_pmts.png")
+    plot_deltaEz_multi([df_base, df_pmts], ["base", "PMTs ON"],
+                       out="deltaEz_vs_E_base_vs_pmts.png")
+    plot_theta_multi([df_base, df_pmts], ["base", "PMTs ON"],
+                     out="theta_vs_E_base_vs_pmts.png")
 
-    # Optimization without PMTs, adjusting rings
-    df_opt_false_all = optimize_voltages_constrained(
-        Bstack, targets, roi_lxe=ROI_LXe,
-        opt_pmts=False,       
-        opt_rings=False,      
-        lambda_inh=0.6,
-        lambda_smooth=0.02,
-        opt_offset=False,                   
-        delta_bounds=(-1000.0, 1000.0)
-    )
+    # Last-ring variation series
+    plot_mean_multi(dfs_last, labels_last, out="deviation_vs_E_LASTRING.png")
+    plot_deltaEz_multi(dfs_last, labels_last, out="deltaEz_vs_E_LASTRING.png")
+    plot_theta_multi(dfs_last, labels_last, out="theta_vs_E_LASTRING.png")
 
-    add_Egas_and_save(df_opt_false_all, "opt_false_all_7rings_roi")
+    # Power-law α series
+    plot_mean_multi(dfs_alpha, labels_last, out="deviation_vs_E_L.png")
+    plot_deltaEz_multi(dfs_alpha, labels_last, out="deltaEz_vs_E_L.png")
+    plot_theta_multi(dfs_alpha, labels_last, out="theta_vs_E_L.png")
 
-
-    row = df_opt_false_all.iloc[(df['Ecm'] - 60).abs().argmin()]
-
-    Vopt = dict(
-        gate=row['V_gate'],
-        cath=row['V_cath'],
-        anode=row['V_anode'],
-        pmt_top=row['V_pmt_top'],
-        pmt_bot=row['V_pmt_bot']
-    )
-
-    # Llama al plot
-    plot_deltaE_map(Bstack, Vopt, roi=ROI_LXe, out="deltaE_map_E60.png")
-
-
-
-
-    df_opt_pmt = optimize_voltages_constrained(
-        Bstack, targets, roi_lxe=ROI_LXe,
-        opt_pmts=True, opt_rings=False
-    )
-    add_Egas_and_save(df_opt_pmt, "opt_pmt_7rings_roi")
-
-    df_opt_rings = optimize_voltages_constrained(
-        Bstack, targets, roi_lxe=ROI_LXe,
-        opt_pmts=False, opt_rings= True
-    )
-    add_Egas_and_save(df_opt_rings, "opt_rings_7rings_roi")
-    
-    df_opt_pmt_rings = optimize_voltages_constrained(
-        Bstack, targets, roi_lxe=ROI_LXe,
-        opt_pmts=True, opt_rings= True
-    )
-    add_Egas_and_save(df_opt_pmt_rings, "opt_pmt_rings_7rings_roi")
-
-    # Escoge tres de tus DataFrames
-    dfs    = [df_opt_false_all , df_opt_pmt, df_opt_rings, df_opt_pmt_rings ]  # ejemplo
-    labels = ["base (rings OFF, PMTs OFF)", "PMTs ON", "rings ON", "PMTs+rings ON"]
-
-    # p90(Er/Ez) ya lo cubre tu plot_p90_multi:
-    plot_p90_multi(dfs, labels, out="deviation_vs_E_3D_MULTI_lastring_8.png")
-
-    # Añade los nuevos “multi”
-    plot_deltaEz_multi(dfs, labels, out="deltaEz_vs_E_3D_MULTI_lastring_8.png")
-    plot_theta_multi(dfs,   labels, out="theta_vs_E_3D_MULTI_lastring_8.png")
-
-
-
-
-    old = BOUNDS['gate']
-    BOUNDS['gate'] = ( -1000.0,  -1000.0)  # -1000 V fijo
-    df_gate_m1000 = optimize_voltages_constrained(Bstack, targets, roi_lxe=ROI_LXe,
-                                            opt_pmts=False, opt_rings= False,
-                                            lambda_inh=0.6, lambda_smooth=0.05)
-    BOUNDS['gate'] = (0.0, 0.0)  # 0 V fijo
-    df_gate_0 = optimize_voltages_constrained(Bstack, targets, roi_lxe=ROI_LXe,
-                                            opt_pmts=False, opt_rings= False,
-                                            lambda_inh=0.6, lambda_smooth=0.05)
-    BOUNDS['gate'] = ( 1000.0,  1000.0)  # +1000 V fijo
-    df_gate_p1000 = optimize_voltages_constrained(Bstack, targets, roi_lxe=ROI_LXe,
-                                            opt_pmts=False, opt_rings= False,
-                                            lambda_inh=0.6, lambda_smooth=0.05)
-
-    BOUNDS['gate'] = old
-
-
-    add_Egas_and_save(df_opt,       "freegate")
-    add_Egas_and_save(df_gate_p1000,  "gatep1000")
-    add_Egas_and_save(df_gate_m1000,  "gatem1000")
-
-    plot_p90_multi(
-        [df_gate_m1000, df_gate_0, df_gate_p1000],
-        labels=[r'$V_{\rm gate}=-1000$ V', r'$V_{\rm gate}=0$ V', r'$V_{\rm gate}=+1000$ V'],
-        out="deviation_vs_E_3D_compare_gate_8.png"
-    )
-    print(">>> Saved: deviation_vs_E_3D_compare_gate_8.png")
-
-
-
+    print(">>> DONE")
