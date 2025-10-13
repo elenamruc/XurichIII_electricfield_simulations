@@ -10,8 +10,10 @@ This repository contains tools to analyze and visualize electric field simulatio
 .
 ├── 2D_analysis_simul.ipynb
 ├── superposition_3D_analysis.py
-├── results_pitch_27mm.csv
-├── results_pitch_1mm.csv
+├── superposition_3D_27mm_27mm.csv
+├── superposition_3D_1mm.csv
+├── superposition_3D_1mm_1mm.csv
+├── superposition_3D_27mm_8r.csv
 └── README.md
 ```
 
@@ -82,7 +84,7 @@ This script can be adapted to use your own COMSOL CSV results (see below).
 
 ### 3. COMSOL Output Files
 
-The `.csv` files (`results_pitch_27mm.csv`, `results_pitch_1mm.csv`) contain the **superposition basis fields** exported from COMSOL for different electrode pitches.
+The `.csv` files contain the **superposition basis fields** exported from COMSOL for different electrode pitches.
 
 Each file corresponds to:
 
