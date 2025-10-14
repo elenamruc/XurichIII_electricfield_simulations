@@ -16,6 +16,7 @@ This repository contains tools to analyze and visualize electric field simulatio
 ├── superposition_3D_27mm_8r.csv
 └── README.md
 ```
+The superposition files are too large to be hosted directly in this repository, so they are available at the following OneDrive link: https://unicancloud-my.sharepoint.com/:u:/g/personal/emr430_alumnos_unican_es/EU09I1Srpn5DlYqJ0mc28AEBWSC-U2-19leH8tyri_Xbxw?e=97raB0
 
 ## Contents
 
